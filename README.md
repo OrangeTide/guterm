@@ -83,8 +83,12 @@ The Makefile only builds the examples and tests. End users drop
 `guterm.h` into their own project and compile it their own way.
 
 ```
-make        # builds _out/demo, _out/vtdemo, _out/term, _out/test_vt
-make test   # runs the unit tests (no display needed)
+make          # builds _out/demo, _out/vtdemo, _out/term and the tests
+make test     # unit tests and a short torture run, no display needed
+make torture  # longer torture run, TORTURE_ITER=n TORTURE_SEED=n
+make asan     # tests under address sanitizer
+make ubsan    # tests under undefined behavior sanitizer
+make cov      # tests with gcov, line report in _out/cov/guterm.h.gcov
 ```
 
 - `examples/demo.c` exercises the cell API: palettes, attributes, glyph
@@ -96,6 +100,10 @@ make test   # runs the unit tests (no display needed)
   POSIX only.
 - `tests/test_vt.c` checks the buffer, UTF-8, font map, key encoder and
   VT layer, built with `GUTERM_NO_WINDOW`.
+- `tests/torture.c` feeds random byte streams, escape sequences and
+  UTF-8 fragments through the VT layer with random resizes, and calls
+  the buffer API and key encoder with random arguments, checking the
+  structural invariants after every step. Deterministic per seed.
 
 SDL3 is found with `pkg-config`.
 

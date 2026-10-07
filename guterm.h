@@ -451,6 +451,8 @@ GUT_API void gut_vt_set_bell_cb(struct gut_vt *vt, void (*fn)(void *ctx),
 #include <stdlib.h>
 #include <string.h>
 
+static void gut_buf_repair_row(struct gut_buf *b, int row);
+
 /****************************************************************
  * Colors and cells
  ****************************************************************/
@@ -710,14 +712,9 @@ gut_buf_resize(struct gut_buf *b, int rows, int cols)
         gut_cell_erase(&cells[i], gut_color_default());
     keep_rows = rows < b->rows ? rows : b->rows;
     keep_cols = cols < b->cols ? cols : b->cols;
-    for (int r = 0; r < keep_rows; r++) {
+    for (int r = 0; r < keep_rows; r++)
         memcpy(&cells[r * cols], &b->cells[r * b->cols],
                (size_t)keep_cols * sizeof(*cells));
-        /* a wide character cut in half at the new right edge */
-        if (keep_cols < b->cols && cells[r * cols + keep_cols - 1].width == 2)
-            gut_cell_erase(&cells[r * cols + keep_cols - 1],
-                           cells[r * cols + keep_cols - 1].bg);
-    }
     memset(dirty, 1, (size_t)rows);
     free(b->cells);
     free(b->dirty);
@@ -725,6 +722,9 @@ gut_buf_resize(struct gut_buf *b, int rows, int cols)
     b->dirty = dirty;
     b->rows = rows;
     b->cols = cols;
+    /* a wide character cut in half at the new right edge */
+    for (int r = 0; r < keep_rows; r++)
+        gut_buf_repair_row(b, r);
     if (b->cursor_row >= rows)
         b->cursor_row = rows - 1;
     if (b->cursor_col >= cols)
@@ -777,6 +777,23 @@ gut_buf_unwide(struct gut_buf *b, int row, int col)
 
         if (right->width == 0)
             gut_cell_erase(right, right->bg);
+    }
+}
+
+/* Restore the wide character pairing of a row after cells were shifted:
+ * a wide cell must be followed by its continuation and a continuation
+ * must follow a wide cell, else the leftover half becomes a blank. */
+static void
+gut_buf_repair_row(struct gut_buf *b, int row)
+{
+    struct gut_cell *r = &b->cells[row * b->cols];
+
+    for (int c = 0; c < b->cols; c++) {
+        if (r[c].width == 2 &&
+            (c + 1 >= b->cols || r[c + 1].width != 0))
+            gut_cell_erase(&r[c], r[c].bg);
+        else if (r[c].width == 0 && (c == 0 || r[c - 1].width != 2))
+            gut_cell_erase(&r[c], r[c].bg);
     }
 }
 
@@ -934,6 +951,8 @@ gut_encode_event(const struct gut_event *ev, char *out, size_t n, int flags)
     int tilde = 0;              /* CSI n ~ keys */
     const char *ss3 = NULL;     /* SS3 letter for F1-F4 */
 
+    if (n)
+        out[0] = '\0';
     if (ev->type == GUT_EVENT_TEXT) {
         len = strlen(ev->text);
         if (len >= n)
@@ -2837,6 +2856,7 @@ gut_vt_putchar(struct gut_vt *vt, uint32_t cp, int width)
 
         for (int i = cols - 1; i >= vt->col + width; i--)
             row[i] = row[i - width];
+        gut_buf_repair_row(b, vt->row);
     }
     gut_buf_put(b, vt->row, vt->col, cp, vt->fg, vt->bg, vt->attrs);
     vt->col += width;
@@ -3034,6 +3054,7 @@ gut_vt_insert_chars(struct gut_vt *vt, int count)
     for (int i = cols - 1; i >= vt->col + count; i--)
         row[i] = row[i - count];
     gut_vt_erase_cols(vt, vt->row, vt->col, vt->col + count);
+    gut_buf_repair_row(b, vt->row);
 }
 
 static void
@@ -3048,6 +3069,7 @@ gut_vt_delete_chars(struct gut_vt *vt, int count)
     for (int i = vt->col; i < cols - count; i++)
         row[i] = row[i + count];
     gut_vt_erase_cols(vt, vt->row, cols - count, cols);
+    gut_buf_repair_row(b, vt->row);
 }
 
 static void
