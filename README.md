@@ -34,6 +34,12 @@ bracketed paste. Pastes arrive as events from the platform chords and
 middle click, IME composition is shown over the cursor and delivered as
 events, and `gut_buf_copy_text()` turns a selection into clipboard text.
 
+## Documentation
+
+`guterm.md` is the programming manual: concepts, every function, the
+event model, clipboard and input method handling, the VT layer and
+portability notes.
+
 ## Usage
 
 In exactly one C file:

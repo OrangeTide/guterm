@@ -2006,6 +2006,7 @@ struct gut_window {
     int preedit_cursor;
     int paste_keys;
     int overlay;
+    int owns_video;             /* gut_open initialised SDL video */
     uint64_t t0;
     int focused;
 };
@@ -2286,10 +2287,13 @@ gut_open(const struct gut_desc *desc)
     w->paste_keys = !d.no_paste_keys;
     w->overlay = !d.no_compose_overlay;
 
-    if (!SDL_WasInit(SDL_INIT_VIDEO) && !SDL_Init(SDL_INIT_VIDEO)) {
-        gut_set_error("SDL_Init", SDL_GetError());
-        free(w);
-        return NULL;
+    if (!SDL_WasInit(SDL_INIT_VIDEO)) {
+        if (!SDL_Init(SDL_INIT_VIDEO)) {
+            gut_set_error("SDL_Init", SDL_GetError());
+            free(w);
+            return NULL;
+        }
+        w->owns_video = 1;
     }
     if (gut_create_context(w, d.title ? d.title : "guterm",
                            cols * w->cell_w, rows * w->cell_h,
@@ -2350,6 +2354,8 @@ gut_close(gut_window *w)
     free(w->event_text);
     free(w->preedit);
     free(w->verts);
+    if (w->owns_video)
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
     free(w);
 }
 
