@@ -157,6 +157,20 @@ GUT_API void gut_buf_scroll(struct gut_buf *b, int top, int bot, int count,
 
 GUT_API void gut_buf_dirty_all(struct gut_buf *b);
 
+enum gut_copy_mode {
+    GUT_COPY_STREAM,    /* reading order from start to end, inclusive */
+    GUT_COPY_RECT,      /* the rectangle with those corners */
+};
+
+/** Turn a region of cells into UTF-8 text for the clipboard. Rows are
+ * joined with newlines, trailing blanks are trimmed from each row, and
+ * continuation cells are skipped. The corners may be given in either
+ * order. Like snprintf, returns the length the full text needs and
+ * writes at most n - 1 bytes plus a NUL; n may be 0 with out NULL. */
+GUT_API size_t gut_buf_copy_text(const struct gut_buf *b, int row0, int col0,
+                                 int row1, int col1, int mode, char *out,
+                                 size_t n);
+
 /****************************************************************
  * UTF-8 and character width
  ****************************************************************/
@@ -210,6 +224,8 @@ enum gut_event_type {
     GUT_EVENT_MOUSE_WHEEL,  /* dx, dy in notches */
     GUT_EVENT_FOCUS_IN,
     GUT_EVENT_FOCUS_OUT,
+    GUT_EVENT_COMPOSE,      /* data, len, cursor: IME text in progress */
+    GUT_EVENT_PASTE,        /* data, len, primary; col, row for primary */
 };
 
 enum gut_mod {
@@ -263,7 +279,12 @@ struct gut_event {
     int key;            /* enum gut_key or codepoint */
     int mods;           /* enum gut_mod bits */
     int repeat;         /* key auto-repeat */
-    char text[32];      /* GUT_EVENT_TEXT, NUL terminated */
+    char text[32];      /* GUT_EVENT_TEXT, NUL terminated, may truncate */
+    const char *data;   /* TEXT, COMPOSE, PASTE: full text, NUL terminated,
+                           owned by the window until the next gut_poll() */
+    size_t len;         /* bytes in data */
+    int cursor;         /* COMPOSE: caret position in codepoints, or -1 */
+    int primary;        /* PASTE: 1 from the primary selection */
     int col, row;       /* mouse position in cells */
     int x, y;           /* mouse position in pixels */
     int button;         /* enum gut_button */
@@ -272,15 +293,19 @@ struct gut_event {
 };
 
 /* gut_encode_event flags */
-#define GUT_ENC_APP_CURSOR  (1 << 0)    /* DECCKM: arrows send SS3 */
-#define GUT_ENC_BS_DEL      (1 << 1)    /* backspace sends DEL (default) */
-#define GUT_ENC_BS_BS       (1 << 2)    /* backspace sends BS */
+#define GUT_ENC_APP_CURSOR    (1 << 0)  /* DECCKM: arrows send SS3 */
+#define GUT_ENC_BS_DEL        (1 << 1)  /* backspace sends DEL (default) */
+#define GUT_ENC_BS_BS         (1 << 2)  /* backspace sends BS */
+#define GUT_ENC_BRACKET_PASTE (1 << 3)  /* wrap pastes in CSI 200~ 201~ */
 
 /** Translate an event into the bytes an xterm would send a program.
  * GUT_EVENT_TEXT copies the text. GUT_EVENT_KEY encodes special keys and
  * Ctrl or Alt combinations; a plain printable key yields nothing because
- * the matching GUT_EVENT_TEXT carries it. Returns bytes written to out,
- * which should hold at least 16. */
+ * the matching GUT_EVENT_TEXT carries it. GUT_EVENT_PASTE copies the
+ * pasted text with newlines turned into carriage returns, bracketed when
+ * the flag asks for it. Like snprintf, returns the length the full
+ * encoding needs and writes at most n - 1 bytes plus a NUL. 16 bytes
+ * cover every key; a paste needs ev->len + 16. */
 GUT_API size_t gut_encode_event(const struct gut_event *ev, char *out,
                                 size_t n, int flags);
 
@@ -298,6 +323,9 @@ struct gut_desc {
     uint32_t fg, bg;                /* 0xRRGGBB defaults; 0 means unset */
     const uint32_t *palette;        /* 16 ANSI colors 0xRRGGBB or NULL */
     int fixed_size;                 /* 1 disables window resizing */
+    int no_paste_keys;              /* 1 delivers paste chords as keys */
+    int no_compose_overlay;         /* 1 leaves IME preedit drawing to
+                                       the program */
 };
 
 typedef struct gut_window gut_window;
@@ -327,6 +355,26 @@ GUT_API void gut_set_palette(gut_window *w, const uint32_t *palette16);
 /** Clipboard text, owned by the window until the next call, or NULL. */
 GUT_API const char *gut_clipboard_get(gut_window *w);
 GUT_API void gut_clipboard_set(gut_window *w, const char *utf8);
+
+/** The primary selection (middle click paste on X11 and Wayland). On
+ * other platforms get returns NULL and set does nothing. */
+GUT_API const char *gut_primary_get(gut_window *w);
+GUT_API void gut_primary_set(gut_window *w, const char *utf8);
+
+/* Paste chords recognised by gut_poll() unless gut_desc.no_paste_keys is
+ * set: Shift+Insert everywhere, Ctrl+Shift+V on Linux and Windows,
+ * Cmd+V on macOS, and middle click for the primary selection. Ctrl+V
+ * alone stays a key, since terminal programs use it. */
+
+/** Turn system text input on or off. On by default; off makes the
+ * platform stop composing text and hides any on-screen keyboard, so only
+ * GUT_EVENT_KEY events arrive. */
+GUT_API void gut_set_text_input(gut_window *w, int on);
+
+/** Draw the in-progress IME text over the cursor cell on the next
+ * gut_present(). On by default; a program that renders the preedit
+ * itself from GUT_EVENT_COMPOSE turns it off. */
+GUT_API void gut_set_compose_overlay(gut_window *w, int on);
 
 /** Milliseconds since gut_open(). */
 GUT_API uint64_t gut_ticks(const gut_window *w);
@@ -901,6 +949,95 @@ gut_buf_dirty_all(struct gut_buf *b)
     memset(b->dirty, 1, (size_t)b->rows);
 }
 
+/* snprintf style sink: counts everything, stores what fits */
+struct gut_sink {
+    char *out;
+    size_t cap;
+    size_t len;
+};
+
+static void
+gut_sink_put(struct gut_sink *s, const char *data, size_t n)
+{
+    if (s->cap > 0 && s->len < s->cap - 1) {
+        size_t room = s->cap - 1 - s->len;
+
+        memcpy(s->out + s->len, data, n < room ? n : room);
+    }
+    s->len += n;
+}
+
+static void
+gut_sink_end(struct gut_sink *s)
+{
+    if (s->cap > 0)
+        s->out[s->len < s->cap - 1 ? s->len : s->cap - 1] = '\0';
+}
+
+static int
+gut_clamp(int v, int lo, int hi)
+{
+    return v < lo ? lo : v > hi ? hi : v;
+}
+
+size_t
+gut_buf_copy_text(const struct gut_buf *b, int row0, int col0, int row1,
+                  int col1, int mode, char *out, size_t n)
+{
+    struct gut_sink s = { out, n, 0 };
+
+    if (row1 < row0 || (row1 == row0 && col1 < col0)) {
+        int t;
+
+        t = row0; row0 = row1; row1 = t;
+        t = col0; col0 = col1; col1 = t;
+    }
+    row0 = gut_clamp(row0, 0, b->rows - 1);
+    row1 = gut_clamp(row1, 0, b->rows - 1);
+    col0 = gut_clamp(col0, 0, b->cols - 1);
+    col1 = gut_clamp(col1, 0, b->cols - 1);
+    if (mode == GUT_COPY_RECT && col1 < col0) {
+        int t = col0;
+
+        col0 = col1;
+        col1 = t;
+    }
+    for (int r = row0; r <= row1; r++) {
+        const struct gut_cell *row = &b->cells[r * b->cols];
+        int from = col0, to = col1;
+        int last;
+
+        if (mode == GUT_COPY_STREAM) {
+            if (r > row0)
+                from = 0;
+            if (r < row1)
+                to = b->cols - 1;
+        }
+        /* trim trailing blanks */
+        for (last = to; last >= from; last--) {
+            const struct gut_cell *c = &row[last];
+
+            if (c->width != 0 && c->cp != ' ' && c->cp != 0)
+                break;
+        }
+        for (int c = from; c <= last; c++) {
+            unsigned char u[4];
+            int ulen;
+
+            if (row[c].width == 0)
+                continue;
+            ulen = gut_utf8_encode(u, row[c].cp ? row[c].cp : ' ');
+            if (ulen == 0)
+                ulen = gut_utf8_encode(u, GUT_RUNE_ERROR);
+            gut_sink_put(&s, (const char *)u, (size_t)ulen);
+        }
+        if (r < row1)
+            gut_sink_put(&s, "\n", 1);
+    }
+    gut_sink_end(&s);
+    return s.len;
+}
+
 /****************************************************************
  * Font lookup
  ****************************************************************/
@@ -953,14 +1090,30 @@ gut_encode_event(const struct gut_event *ev, char *out, size_t n, int flags)
 
     if (n)
         out[0] = '\0';
-    if (ev->type == GUT_EVENT_TEXT) {
-        len = strlen(ev->text);
-        if (len >= n)
-            len = n ? n - 1 : 0;
-        memcpy(out, ev->text, len);
-        if (n)
-            out[len] = '\0';
-        return len;
+    if (ev->type == GUT_EVENT_TEXT || ev->type == GUT_EVENT_PASTE) {
+        struct gut_sink s = { out, n, 0 };
+        const char *text = ev->data ? ev->data : ev->text;
+        size_t tlen = ev->data ? ev->len : strlen(ev->text);
+
+        if (ev->type == GUT_EVENT_PASTE && (flags & GUT_ENC_BRACKET_PASTE))
+            gut_sink_put(&s, "\033[200~", 6);
+        if (ev->type == GUT_EVENT_PASTE) {
+            /* a terminal sends Enter as CR; \r\n becomes one CR */
+            for (size_t i = 0; i < tlen; i++) {
+                if (text[i] == '\n') {
+                    if (i == 0 || text[i - 1] != '\r')
+                        gut_sink_put(&s, "\r", 1);
+                } else {
+                    gut_sink_put(&s, &text[i], 1);
+                }
+            }
+        } else {
+            gut_sink_put(&s, text, tlen);
+        }
+        if (ev->type == GUT_EVENT_PASTE && (flags & GUT_ENC_BRACKET_PASTE))
+            gut_sink_put(&s, "\033[201~", 6);
+        gut_sink_end(&s);
+        return s.len;
     }
     if (ev->type != GUT_EVENT_KEY)
         return 0;
@@ -1076,11 +1229,12 @@ gut_encode_event(const struct gut_event *ev, char *out, size_t n, int flags)
             len = (size_t)snprintf(tmp, sizeof(tmp), "\033O%s", ss3);
     }
 
-    if (len >= n)
-        len = n ? n - 1 : 0;
-    memcpy(out, tmp, len);
-    if (n)
-        out[len] = '\0';
+    {
+        struct gut_sink s = { out, n, 0 };
+
+        gut_sink_put(&s, tmp, len);
+        gut_sink_end(&s);
+    }
     return len;
 }
 
@@ -1774,6 +1928,17 @@ static struct {
 
 #define GUT_GL(fn) (gut_gl.fn)
 
+static char *
+gut_strdup(const char *s)
+{
+    size_t n = strlen(s) + 1;
+    char *p = malloc(n);
+
+    if (p)
+        memcpy(p, s, n);
+    return p;
+}
+
 static char gut_errbuf[1024];
 
 const char *
@@ -1834,7 +1999,13 @@ struct gut_window {
     struct gut_vertex *verts;
     size_t nverts, cap;
 
-    char *clip;
+    char *clip;                 /* last clipboard text handed out */
+    char *primary;              /* last primary selection handed out */
+    char *event_text;           /* data of the last TEXT or PASTE event */
+    char *preedit;              /* IME composition in progress, or NULL */
+    int preedit_cursor;
+    int paste_keys;
+    int overlay;
     uint64_t t0;
     int focused;
 };
@@ -2112,6 +2283,8 @@ gut_open(const struct gut_desc *desc)
     w->def_fg = d.fg ? d.fg : 0xD0D0D0;
     w->def_bg = d.bg ? d.bg : 0x000000;
     w->focused = 1;
+    w->paste_keys = !d.no_paste_keys;
+    w->overlay = !d.no_compose_overlay;
 
     if (!SDL_WasInit(SDL_INIT_VIDEO) && !SDL_Init(SDL_INIT_VIDEO)) {
         gut_set_error("SDL_Init", SDL_GetError());
@@ -2172,6 +2345,10 @@ gut_close(gut_window *w)
         SDL_DestroyWindow(w->win);
     if (w->clip)
         SDL_free(w->clip);
+    if (w->primary)
+        SDL_free(w->primary);
+    free(w->event_text);
+    free(w->preedit);
     free(w->verts);
     free(w);
 }
@@ -2218,6 +2395,40 @@ gut_clipboard_set(gut_window *w, const char *utf8)
 {
     (void)w;
     SDL_SetClipboardText(utf8 ? utf8 : "");
+}
+
+const char *
+gut_primary_get(gut_window *w)
+{
+    if (w->primary)
+        SDL_free(w->primary);
+    w->primary = SDL_HasPrimarySelectionText() ? SDL_GetPrimarySelectionText()
+                                               : NULL;
+    return (w->primary && w->primary[0]) ? w->primary : NULL;
+}
+
+void
+gut_primary_set(gut_window *w, const char *utf8)
+{
+    (void)w;
+    SDL_SetPrimarySelectionText(utf8 ? utf8 : "");
+}
+
+void
+gut_set_text_input(gut_window *w, int on)
+{
+    if (on)
+        SDL_StartTextInput(w->win);
+    else
+        SDL_StopTextInput(w->win);
+    free(w->preedit);
+    w->preedit = NULL;
+}
+
+void
+gut_set_compose_overlay(gut_window *w, int on)
+{
+    w->overlay = on;
 }
 
 uint64_t
@@ -2397,6 +2608,71 @@ gut_draw_cell(gut_window *w, const struct gut_cell *c, int row, int col,
     }
 }
 
+/* Draw the IME composition from the cursor cell rightwards, underlined,
+ * with a bar at the composition caret. It is an overlay: the buffer
+ * underneath is untouched and the committed text replaces it. */
+static void
+gut_draw_preedit(gut_window *w, const struct gut_buf *b)
+{
+    const unsigned char *s = (const unsigned char *)w->preedit;
+    size_t len = strlen(w->preedit);
+    int row = b->cursor_row, col = b->cursor_col;
+    int index = 0;
+    float s1 = (float)w->scale;
+
+    while (len > 0 && row < w->rows) {
+        uint32_t cp;
+        int n = gut_utf8_decode(&cp, s, len);
+        int width = gut_rune_width(cp);
+        struct gut_cell cell;
+        float x, y;
+
+        s += n;
+        len -= (size_t)n;
+        if (width <= 0)
+            continue;
+        if (col + width > w->cols) {
+            row++;
+            col = 0;
+            if (row >= w->rows)
+                break;
+        }
+        x = (float)(col * w->cell_w);
+        y = (float)(row * w->cell_h);
+        if (index == w->preedit_cursor)
+            gut_rect(w, x, y, s1, (float)w->cell_h, w->def_fg);
+        memset(&cell, 0, sizeof(cell));
+        cell.cp = cp;
+        cell.width = (uint8_t)width;
+        cell.attrs = GUT_ATTR_UNDERLINE;
+        gut_rect(w, x, y, (float)(w->cell_w * width), (float)w->cell_h,
+                 w->def_bg);
+        gut_draw_cell(w, &cell, row, col, 0);
+        col += width;
+        index++;
+    }
+    if (index == w->preedit_cursor && row < w->rows && col < w->cols)
+        gut_rect(w, (float)(col * w->cell_w), (float)(row * w->cell_h), s1,
+                 (float)w->cell_h, w->def_fg);
+}
+
+/* Tell the platform where the cursor is so an IME can place its
+ * candidate list next to it. Coordinates are window points. */
+static void
+gut_text_input_area(gut_window *w, const struct gut_buf *b)
+{
+    float density = SDL_GetWindowPixelDensity(w->win);
+    SDL_Rect r;
+
+    if (density <= 0.0f)
+        density = 1.0f;
+    r.x = (int)(b->cursor_col * w->cell_w / density);
+    r.y = (int)(b->cursor_row * w->cell_h / density);
+    r.w = (int)(w->cell_w / density);
+    r.h = (int)(w->cell_h / density);
+    SDL_SetTextInputArea(w->win, &r, 0);
+}
+
 void
 gut_present(gut_window *w, struct gut_buf *b)
 {
@@ -2433,6 +2709,8 @@ gut_present(gut_window *w, struct gut_buf *b)
             gut_draw_cell(w, cell, r, c, cursor);
         }
     }
+    if (w->overlay && w->preedit && w->preedit[0])
+        gut_draw_preedit(w, b);
 
     GUT_GL(glViewport)(0, 0, w->px_w, w->px_h);
     GUT_GL(glClearColor)(((w->def_bg >> 16) & 0xFF) / 255.0f,
@@ -2465,6 +2743,7 @@ gut_present(gut_window *w, struct gut_buf *b)
     }
     SDL_GL_SwapWindow(w->win);
     memset(b->dirty, 0, (size_t)b->rows);
+    gut_text_input_area(w, b);
 }
 
 /****************************************************************
@@ -2543,10 +2822,57 @@ gut_mouse_pos(const gut_window *w, float px, float py, struct gut_event *ev)
     ev->row = ev->y / w->cell_h;
 }
 
+/* Hand text to the program through data and len, owned by the window
+ * until the next gut_poll(). */
+static void
+gut_set_event_text(gut_window *w, struct gut_event *ev, const char *text)
+{
+    size_t len = strlen(text);
+    char *copy = gut_strdup(text);
+
+    free(w->event_text);
+    w->event_text = NULL;
+    if (!copy) {
+        ev->data = "";
+        ev->len = 0;
+        return;
+    }
+    w->event_text = copy;
+    ev->data = copy;
+    ev->len = len;
+}
+
+static int
+gut_is_paste_chord(const struct gut_event *ev)
+{
+    if (ev->key == GUT_KEY_INSERT && ev->mods == GUT_MOD_SHIFT)
+        return 1;
+#if defined(__APPLE__)
+    return ev->key == 'v' && ev->mods == GUT_MOD_SUPER;
+#else
+    return ev->key == 'v' && ev->mods == (GUT_MOD_CTRL | GUT_MOD_SHIFT);
+#endif
+}
+
+/* Turn the event into a paste of text, when there is any. The mouse or
+ * key fields already filled stay, so a primary paste reports its cell. */
+static int
+gut_paste_event(gut_window *w, struct gut_event *ev, const char *text,
+                int primary)
+{
+    if (!text || !text[0])
+        return 0;
+    ev->type = GUT_EVENT_PASTE;
+    ev->primary = primary;
+    gut_set_event_text(w, ev, text);
+    return 1;
+}
+
 static int
 gut_translate(gut_window *w, const SDL_Event *e, struct gut_event *ev)
 {
     memset(ev, 0, sizeof(*ev));
+    ev->cursor = -1;
     ev->mods = gut_mods_from_sdl(SDL_GetModState());
 
     switch (e->type) {
@@ -2581,10 +2907,25 @@ gut_translate(gut_window *w, const SDL_Event *e, struct gut_event *ev)
         ev->type = GUT_EVENT_KEY;
         ev->mods = gut_mods_from_sdl(e->key.mod);
         ev->repeat = e->key.repeat ? 1 : 0;
+        if (w->paste_keys && gut_is_paste_chord(ev) &&
+            gut_paste_event(w, ev, gut_clipboard_get(w), 0))
+            return 1;
         return 1;
     case SDL_EVENT_TEXT_INPUT:
         ev->type = GUT_EVENT_TEXT;
         snprintf(ev->text, sizeof(ev->text), "%s", e->text.text);
+        gut_set_event_text(w, ev, e->text.text);
+        free(w->preedit);
+        w->preedit = NULL;
+        return 1;
+    case SDL_EVENT_TEXT_EDITING:
+        free(w->preedit);
+        w->preedit = e->edit.text && e->edit.text[0] ? gut_strdup(e->edit.text)
+                                                     : NULL;
+        w->preedit_cursor = e->edit.start;
+        ev->type = GUT_EVENT_COMPOSE;
+        ev->cursor = e->edit.start;
+        gut_set_event_text(w, ev, e->edit.text ? e->edit.text : "");
         return 1;
     case SDL_EVENT_MOUSE_MOTION:
         ev->type = GUT_EVENT_MOUSE_MOVE;
@@ -2605,6 +2946,10 @@ gut_translate(gut_window *w, const SDL_Event *e, struct gut_event *ev)
                    : e->button.button == SDL_BUTTON_MIDDLE ? GUT_BUTTON_MIDDLE
                    : e->button.button == SDL_BUTTON_RIGHT ? GUT_BUTTON_RIGHT
                    : 0;
+        if (w->paste_keys && ev->type == GUT_EVENT_MOUSE_DOWN &&
+            ev->button == GUT_BUTTON_MIDDLE &&
+            gut_paste_event(w, ev, gut_primary_get(w), 1))
+            return 1;
         return 1;
     case SDL_EVENT_MOUSE_WHEEL:
         ev->type = GUT_EVENT_MOUSE_WHEEL;
@@ -2623,6 +2968,10 @@ gut_poll(gut_window *w, struct gut_event *ev, int timeout_ms)
     uint64_t deadline = SDL_GetTicks() + (uint64_t)(timeout_ms > 0 ?
                                                     timeout_ms : 0);
     SDL_Event e;
+
+    /* text handed out with the previous event expires now */
+    free(w->event_text);
+    w->event_text = NULL;
 
     for (;;) {
         int wait;
@@ -3644,7 +3993,13 @@ gut_vt_modes(const struct gut_vt *vt)
 int
 gut_vt_encode_flags(const struct gut_vt *vt)
 {
-    return (vt->modes & GUT_VT_MODE_APP_CURSOR) ? GUT_ENC_APP_CURSOR : 0;
+    int flags = 0;
+
+    if (vt->modes & GUT_VT_MODE_APP_CURSOR)
+        flags |= GUT_ENC_APP_CURSOR;
+    if (vt->modes & GUT_VT_MODE_BRACKETPASTE)
+        flags |= GUT_ENC_BRACKET_PASTE;
+    return flags;
 }
 
 void

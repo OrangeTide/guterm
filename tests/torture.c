@@ -380,6 +380,7 @@ torture_encode(unsigned long iterations)
         struct gut_event ev;
         size_t cap = (size_t)rnd_range(0, 20);
         char *out = malloc(cap ? cap : 1);
+        char *data = NULL;
         size_t n;
 
         memset(&ev, 0, sizeof(ev));
@@ -395,15 +396,59 @@ torture_encode(unsigned long iterations)
         ev.text[rnd_range(0, (int)sizeof(ev.text) - 1)] = '\0';
         ev.text[sizeof(ev.text) - 1] = '\0';
 
-        n = gut_encode_event(&ev, out, cap, rnd_range(0, 7));
-        if (cap == 0 && n != 0)
-            FAIL("encode wrote %lu bytes into empty buffer",
-                 (unsigned long)n);
-        if (cap > 0 && (n >= cap || out[n] != '\0'))
-            FAIL("encode returned %lu for cap %lu", (unsigned long)n,
-                 (unsigned long)cap);
+        /* PASTE and COMPOSE carry their text through data and len */
+        if (rnd_range(0, 3) == 0) {
+            size_t dlen = (size_t)rnd_range(0, 40);
+
+            data = malloc(dlen + 1);
+            for (size_t i = 0; i < dlen; i++)
+                data[i] = (char)rnd_range(1, 255);
+            data[dlen] = '\0';
+            ev.data = data;
+            ev.len = dlen;
+            ev.type = rnd_range(0, 1) ? GUT_EVENT_PASTE : GUT_EVENT_COMPOSE;
+        }
+
+        n = gut_encode_event(&ev, out, cap, rnd_range(0, 15));
+        if (cap > 0 && out[n < cap ? n : cap - 1] != '\0')
+            FAIL("encode output not terminated, %lu for cap %lu",
+                 (unsigned long)n, (unsigned long)cap);
+        if (ev.type == GUT_EVENT_PASTE && n > ev.len + 12)
+            FAIL("paste encoding longer than text plus brackets");
+        free(data);
         free(out);
     }
+}
+
+static void
+torture_copy(unsigned long iterations)
+{
+    struct gut_buf b;
+
+    gut_buf_init(&b, rnd_range(1, 20), rnd_range(1, 60));
+    for (iter = 0; iter < iterations; iter++) {
+        size_t cap = (size_t)rnd_range(0, 64);
+        char *out = malloc(cap ? cap : 1);
+        size_t n;
+
+        if (rnd_range(0, 3) == 0)
+            gut_buf_put(&b, rnd_range(0, b.rows - 1), rnd_range(0, b.cols - 1),
+                        rnd_range(0, 1) ? (uint32_t)rnd_range(0x21, 0x7E)
+                                        : (uint32_t)rnd_range(0x4E00, 0x4E20),
+                        gut_color_default(), gut_color_default(), 0);
+        n = gut_buf_copy_text(&b, rnd_range(-2, b.rows + 2),
+                              rnd_range(-2, b.cols + 2),
+                              rnd_range(-2, b.rows + 2),
+                              rnd_range(-2, b.cols + 2), rnd_range(0, 1),
+                              cap ? out : NULL, cap);
+        if (cap > 0 && out[n < cap ? n : cap - 1] != '\0')
+            FAIL("copy output not terminated");
+        if (cap > 0 && n < cap && strlen(out) != n)
+            FAIL("copy length %lu does not match %lu", (unsigned long)n,
+                 (unsigned long)strlen(out));
+        free(out);
+    }
+    gut_buf_free(&b);
 }
 
 static void
@@ -454,6 +499,7 @@ main(int argc, char **argv)
     torture_vt(iterations);
     torture_buf(iterations);
     torture_encode(iterations);
+    torture_copy(iterations);
     torture_utf8(iterations);
     printf("torture: %d failures\n", failures);
     return failures ? 1 : 0;

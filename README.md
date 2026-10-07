@@ -29,7 +29,10 @@ The header has three layers:
 | `gut_vt` | libc | Optional VT100/xterm emulator that writes into a `gut_buf`. |
 
 `gut_encode_event()` turns input events into the byte sequences an xterm
-sends, for programs that already speak the terminal protocol.
+sends, for programs that already speak the terminal protocol, including
+bracketed paste. Pastes arrive as events from the platform chords and
+middle click, IME composition is shown over the cursor and delivered as
+events, and `gut_buf_copy_text()` turns a selection into clipboard text.
 
 ## Usage
 

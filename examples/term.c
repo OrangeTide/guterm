@@ -118,6 +118,50 @@ drain(struct app *a)
     }
 }
 
+static void resize(struct app *a, int rows, int cols);
+
+/* Encode an input event and send it to the child. */
+static void
+send_event(struct app *a, const struct gut_event *ev)
+{
+    char small[64];
+    char *buf = small;
+    size_t cap = sizeof(small);
+    size_t n;
+
+    if (ev->len + 16 > cap) {
+        cap = ev->len + 16;
+        buf = malloc(cap);
+        if (!buf)
+            return;
+    }
+    n = gut_encode_event(ev, buf, cap, gut_vt_encode_flags(&a->vt));
+    if (n > 0 && n < cap)
+        pty_write(a, buf, n);
+    if (buf != small)
+        free(buf);
+}
+
+static void
+handle_event(struct app *a, const struct gut_event *ev, int *running)
+{
+    switch (ev->type) {
+    case GUT_EVENT_QUIT:
+        *running = 0;
+        break;
+    case GUT_EVENT_RESIZE:
+        resize(a, ev->rows, ev->cols);
+        break;
+    case GUT_EVENT_KEY:
+    case GUT_EVENT_TEXT:
+    case GUT_EVENT_PASTE:
+        send_event(a, ev);
+        break;
+    default:
+        break;
+    }
+}
+
 static void
 resize(struct app *a, int rows, int cols)
 {
@@ -170,39 +214,9 @@ main(void)
             have_event = gut_poll(a.w, &ev, 0);
         }
         if (have_event) {
-            char bytes[16];
-            size_t n;
-
-            switch (ev.type) {
-            case GUT_EVENT_QUIT:
-                running = 0;
-                break;
-            case GUT_EVENT_RESIZE:
-                resize(&a, ev.rows, ev.cols);
-                break;
-            case GUT_EVENT_KEY:
-            case GUT_EVENT_TEXT:
-                n = gut_encode_event(&ev, bytes, sizeof(bytes),
-                                     gut_vt_encode_flags(&a.vt));
-                if (n > 0)
-                    pty_write(&a, bytes, n);
-                break;
-            default:
-                break;
-            }
-            while (gut_poll(a.w, &ev, 0)) {
-                if (ev.type == GUT_EVENT_QUIT)
-                    running = 0;
-                else if (ev.type == GUT_EVENT_RESIZE)
-                    resize(&a, ev.rows, ev.cols);
-                else if (ev.type == GUT_EVENT_KEY ||
-                         ev.type == GUT_EVENT_TEXT) {
-                    n = gut_encode_event(&ev, bytes, sizeof(bytes),
-                                         gut_vt_encode_flags(&a.vt));
-                    if (n > 0)
-                        pty_write(&a, bytes, n);
-                }
-            }
+            handle_event(&a, &ev, &running);
+            while (gut_poll(a.w, &ev, 0))
+                handle_event(&a, &ev, &running);
         }
         if (!drain(&a))
             break;

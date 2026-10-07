@@ -159,6 +159,90 @@ test_encode(void)
           out[0] == 0x7F);
     CHECK(enc(GUT_EVENT_KEY, GUT_KEY_ENTER, 0, NULL, 0, out) == 1 &&
           out[0] == '\r');
+
+    /* snprintf semantics: full length returned, output truncated */
+    {
+        struct gut_event ev;
+        char small[4];
+
+        memset(&ev, 0, sizeof(ev));
+        ev.type = GUT_EVENT_KEY;
+        ev.key = GUT_KEY_F5;
+        CHECK(gut_encode_event(&ev, small, sizeof(small), 0) == 5);
+        CHECK(memcmp(small, "\033[1", 3) == 0 && small[3] == '\0');
+        CHECK(gut_encode_event(&ev, NULL, 0, 0) == 5);
+
+        /* paste: newlines become CR, bracketed on request */
+        ev.type = GUT_EVENT_PASTE;
+        ev.data = "a\r\nb\nc";
+        ev.len = 6;
+        CHECK(gut_encode_event(&ev, out, 16, 0) == 5 &&
+              memcmp(out, "a\rb\rc", 5) == 0);
+        CHECK(gut_encode_event(&ev, out, 16, GUT_ENC_BRACKET_PASTE) == 17);
+        CHECK(gut_encode_event(&ev, out, 16, GUT_ENC_BRACKET_PASTE) == 17 &&
+              memcmp(out, "\033[200~a\rb\rc\033[20", 15) == 0 &&
+              out[15] == '\0');
+        {
+            char big[32];
+
+            CHECK(gut_encode_event(&ev, big, sizeof(big),
+                                   GUT_ENC_BRACKET_PASTE) == 17 &&
+                  memcmp(big, "\033[200~a\rb\rc\033[201~", 17) == 0);
+        }
+        /* text events prefer data over the fixed array */
+        ev.type = GUT_EVENT_TEXT;
+        snprintf(ev.text, sizeof(ev.text), "short");
+        ev.data = "the whole committed string";
+        ev.len = strlen(ev.data);
+        CHECK(gut_encode_event(&ev, out, 16, 0) == ev.len);
+        ev.data = NULL;
+        CHECK(gut_encode_event(&ev, out, 16, 0) == 5);
+    }
+}
+
+static void
+test_copy(void)
+{
+    struct gut_buf b;
+    char out[64];
+    size_t n;
+
+    gut_buf_init(&b, 3, 8);
+    gut_buf_text(&b, 0, 0, "ab  cd", gut_color_default(),
+                 gut_color_default(), 0);
+    gut_buf_text(&b, 1, 2, "x\xe6\xbc\xa2y", gut_color_default(),
+                 gut_color_default(), 0);
+    gut_buf_text(&b, 2, 0, "end", gut_color_default(), gut_color_default(),
+                 0);
+
+    /* stream: whole rows between the corners, trailing blanks trimmed */
+    n = gut_buf_copy_text(&b, 0, 4, 2, 1, GUT_COPY_STREAM, out, sizeof(out));
+    CHECK(n == strlen(out));
+    CHECK(strcmp(out, "cd\n  x\xe6\xbc\xa2y\nen") == 0);
+
+    /* reversed corners give the same result */
+    n = gut_buf_copy_text(&b, 2, 1, 0, 4, GUT_COPY_STREAM, out, sizeof(out));
+    CHECK(strcmp(out, "cd\n  x\xe6\xbc\xa2y\nen") == 0);
+
+    /* rectangle */
+    n = gut_buf_copy_text(&b, 0, 0, 2, 2, GUT_COPY_RECT, out, sizeof(out));
+    CHECK(strcmp(out, "ab\n  x\nend") == 0);
+
+    /* continuation cell at the rectangle's left edge is skipped */
+    n = gut_buf_copy_text(&b, 1, 4, 1, 5, GUT_COPY_RECT, out, sizeof(out));
+    CHECK(strcmp(out, "y") == 0);
+
+    /* truncation and sizing */
+    n = gut_buf_copy_text(&b, 0, 0, 0, 7, GUT_COPY_RECT, NULL, 0);
+    CHECK(n == 6);
+    n = gut_buf_copy_text(&b, 0, 0, 0, 7, GUT_COPY_RECT, out, 3);
+    CHECK(n == 6 && strcmp(out, "ab") == 0);
+
+    /* out of range corners are clamped */
+    n = gut_buf_copy_text(&b, -5, -5, 50, 50, GUT_COPY_STREAM, out,
+                          sizeof(out));
+    CHECK(strcmp(out, "ab  cd\n  x\xe6\xbc\xa2y\nend") == 0);
+    gut_buf_free(&b);
 }
 
 static char last_title[64];
@@ -280,6 +364,10 @@ test_vt(void)
     CHECK(gut_vt_encode_flags(&vt) == GUT_ENC_APP_CURSOR);
     feed(&vt, "\033[?1l");
     CHECK(gut_vt_encode_flags(&vt) == 0);
+    feed(&vt, "\033[?2004h");
+    CHECK(gut_vt_encode_flags(&vt) == GUT_ENC_BRACKET_PASTE);
+    feed(&vt, "\033[?2004l");
+    CHECK(gut_vt_encode_flags(&vt) == 0);
 
     /* OSC title with BEL and ST terminators */
     feed(&vt, "\033]2;hello\007");
@@ -324,6 +412,7 @@ main(void)
     test_utf8();
     test_font();
     test_encode();
+    test_copy();
     test_vt();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

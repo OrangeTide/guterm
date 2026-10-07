@@ -106,7 +106,9 @@ main(int argc, char **argv)
     gut_present(w, &buf);
 
     while (running && gut_poll(w, &ev, -1)) {
-        char bytes[16];
+        char bytes[64];
+        char *big = NULL;
+        char *enc = bytes;
         size_t n;
 
         switch (ev.type) {
@@ -131,10 +133,15 @@ main(int argc, char **argv)
             }
             /* fall through */
         case GUT_EVENT_TEXT:
-            n = gut_encode_event(&ev, bytes, sizeof(bytes),
+        case GUT_EVENT_PASTE:
+            /* a paste can be larger than the stack buffer */
+            if (ev.len + 16 > sizeof(bytes))
+                enc = big = malloc(ev.len + 16);
+            n = gut_encode_event(&ev, enc, big ? ev.len + 16 : sizeof(bytes),
                                  gut_vt_encode_flags(&vt));
             if (n > 0)
-                gut_vt_feed(&vt, bytes, n);
+                gut_vt_feed(&vt, enc, n);
+            free(big);
             break;
         default:
             break;

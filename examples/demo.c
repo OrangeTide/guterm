@@ -191,6 +191,17 @@ main(int argc, char **argv)
             snprintf(status, sizeof(status), "wheel dx %d dy %d", ev.dx,
                      ev.dy);
             break;
+        case GUT_EVENT_PASTE:
+            echo_col += gut_buf_text(&buf, echo_row, echo_col, ev.data,
+                                     gut_color_indexed(13),
+                                     gut_color_default(), 0);
+            snprintf(status, sizeof(status), "paste %lu bytes%s",
+                     (unsigned long)ev.len, ev.primary ? " (primary)" : "");
+            break;
+        case GUT_EVENT_COMPOSE:
+            snprintf(status, sizeof(status), "compose \"%s\" caret %d",
+                     ev.data, ev.cursor);
+            break;
         default:
             status[0] = '\0';
             break;

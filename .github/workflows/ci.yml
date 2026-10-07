@@ -103,7 +103,7 @@ jobs:
           # timeout proves the window and GL context came up.
           for demo in demo vtdemo; do
             xvfb-run -a -s "-screen 0 1600x1000x24" \
-              timeout -s INT 5 ./_out/$demo
+              timeout --preserve-status -s INT 5 ./_out/$demo
             rc=$?
             echo "$demo exit $rc"
             test "$rc" -eq 0
