@@ -107,6 +107,12 @@ make cov      # tests with gcov, line report in _out/cov/guterm.h.gcov
 
 SDL3 is found with `pkg-config`.
 
+The GitHub Actions workflow in `.github/workflows/ci.yml` runs the tests
+with gcc and clang, the long torture run, both sanitizers, coverage, the
+examples against an SDL3 built from source with the demos started under
+Xvfb, a macOS build with Homebrew SDL3, and a mingw cross build with the
+unit tests run under wine.
+
 ## Target Platforms
 
 - Linux x86_64, aarch64 (Raspberry Pi 3+)

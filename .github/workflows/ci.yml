@@ -1,0 +1,148 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SDL3_VERSION: 3.2.24
+
+jobs:
+  # The tests build with GUTERM_NO_WINDOW and need nothing beyond libc.
+  test:
+    name: test (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Unit tests and short torture run
+        run: make CC=${{ matrix.cc }} test
+      - name: Long torture run
+        run: make CC=${{ matrix.cc }} torture TORTURE_ITER=500000
+
+  sanitizers:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [asan, ubsan]
+    steps:
+      - uses: actions/checkout@v6
+      - run: make CC=clang ${{ matrix.target }}
+
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - run: make cov
+      - uses: actions/upload-artifact@v6
+        with:
+          name: coverage
+          path: _out/cov/*.gcov
+          retention-days: 14
+
+  # The examples need SDL3, which Ubuntu 24.04 does not package, so it is
+  # built from the release tarball and cached. The demos then run under
+  # Xvfb with Mesa so window and context creation are exercised.
+  examples-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install build and display dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev \
+            libxi-dev libxfixes-dev libxkbcommon-dev libwayland-dev \
+            libegl1-mesa-dev libgles2-mesa-dev libgl1-mesa-dev \
+            libdrm-dev libgbm-dev \
+            xvfb libgl1-mesa-dri libegl1 libgles2
+      - name: Cache SDL3
+        id: sdl-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/sdl3
+          key: sdl3-${{ env.SDL3_VERSION }}-${{ runner.os }}-v1
+      - name: Build SDL3
+        if: steps.sdl-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o sdl3.tar.gz \
+            "https://github.com/libsdl-org/SDL/releases/download/release-${SDL3_VERSION}/SDL3-${SDL3_VERSION}.tar.gz"
+          mkdir sdl3-src
+          tar -xzf sdl3.tar.gz --strip-components=1 -C sdl3-src
+          cmake -S sdl3-src -B sdl3-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$HOME/sdl3" \
+            -DSDL_TEST_LIBRARY=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF
+          cmake --build sdl3-build
+          cmake --install sdl3-build
+      - name: Build everything
+        run: PKG_CONFIG_PATH="$HOME/sdl3/lib/pkgconfig" make
+      - name: Run the demos under Xvfb
+        run: |
+          export LD_LIBRARY_PATH="$HOME/sdl3/lib"
+          # SDL turns SIGINT into a quit event, so a clean exit after the
+          # timeout proves the window and GL context came up.
+          for demo in demo vtdemo; do
+            xvfb-run -a -s "-screen 0 1600x1000x24" \
+              timeout -s INT 5 ./_out/$demo
+            rc=$?
+            echo "$demo exit $rc"
+            test "$rc" -eq 0
+          done
+
+  examples-macos:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - run: brew install sdl3
+      - run: make
+      - run: make test
+
+  # Compile the Windows build with mingw to check the __stdcall GL loader
+  # and the SDL3 prebuilt development package.
+  examples-windows-cross:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - run: sudo apt-get update && sudo apt-get install -y mingw-w64 wine64
+      - name: Fetch SDL3 mingw development package
+        run: |
+          curl -fsSL -o sdl3-mingw.tar.gz \
+            "https://github.com/libsdl-org/SDL/releases/download/release-${SDL3_VERSION}/SDL3-devel-${SDL3_VERSION}-mingw.tar.gz"
+          mkdir sdl3-mingw
+          tar -xzf sdl3-mingw.tar.gz --strip-components=1 -C sdl3-mingw
+      - name: Cross compile the examples
+        run: |
+          SDL=sdl3-mingw/x86_64-w64-mingw32
+          mkdir -p _out/win
+          for demo in demo vtdemo; do
+            x86_64-w64-mingw32-gcc -std=c99 -O2 -Wall -Wextra -Wpedantic \
+              -I. -I"$SDL/include" -o _out/win/$demo.exe examples/$demo.c \
+              -L"$SDL/lib" -lSDL3 -lmingw32 -mwindows
+          done
+          x86_64-w64-mingw32-gcc -std=c99 -O2 -Wall -Wextra -I. \
+            -o _out/win/test_vt.exe tests/test_vt.c
+          ls -l _out/win
+      - name: Run the unit tests under wine
+        run: WINEDEBUG=-all wine _out/win/test_vt.exe
