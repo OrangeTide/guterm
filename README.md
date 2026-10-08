@@ -110,6 +110,7 @@ make torture  # longer torture run, TORTURE_ITER=n TORTURE_SEED=n
 make asan     # tests under address sanitizer
 make ubsan    # tests under undefined behavior sanitizer
 make cov      # tests with gcov, line report in _out/cov/guterm.h.gcov
+make release-check  # the header, manual, tag and tree agree
 ```
 
 - `examples/demo.c` exercises the cell API: palettes, attributes, glyph
@@ -158,4 +159,5 @@ Not yet done:
 - Blink is accepted but drawn as normal text.
 - Combining characters are dropped; wide characters use two cells but
   the built-in font has no CJK glyphs, so they draw as `?`.
-- Windows and macOS builds are untested.
+- Windows and macOS have not run on real hardware. The Windows build
+  runs under wine in CI and the macOS build compiles there.

@@ -5,48 +5,11 @@ this file when it is done or decided against; the git history keeps the
 record. The README status list is the short public summary of the same
 things.
 
-## Next: gvedit integration and the 0.2.0 release
-
-gvedit vendors `guterm.h` at 0.1.0 and still alternates short polls on
-its terminal panel ptys, the pattern `gut_wake` replaced. The release
-comes last so a real host proves `gut_wake` and sixel before the tag.
-Four phases, each landing with its checks before the next.
-
-Decisions:
-
-- One watcher thread for every panel pty, not one per panel. The main
-  loop hands it the descriptor set over a control pipe before each
-  wait, the thread polls them and calls `gut_wake` when one is ready,
-  then stops watching until it is given the set again, so a level
-  triggered descriptor never spins. The main loop finds which ones are
-  ready with a zero timeout poll of its own. Windows keeps its pseudo
-  console path.
-- A window close is a quit request, as File > Exit, with the unsaved
-  prompt. gvedit already does this; the earlier roadmap item was
-  stale.
-- `GUT_VERSION` in the header stays the authority on the version. A
-  `make release-check` target verifies the manual, the tag and the
-  header agree and the tree is clean. No version file.
-- Running on a real high density display needs hardware this plan
-  cannot reach. It stays a manual item on the release checklist.
-
-Phases (in the vedit checkout for 1 and 2, both done):
-
-1. `gut_wake` in gvedit. Sync the header, add the watcher thread and
-   its control pipe, and make the window wait block in `gut_poll` with
-   the editor's timeout. Check: a terminal panel open and idle makes no
-   wakeups per frame (count with strace), and output still arrives at
-   once. Screenshot under Xvfb as the existing script does.
-
-2. gvedit for Windows. Cross build with mingw and the SDL3 mingw
-   package as guterm's CI job does, run `--version` under wine, and add
-   both to vedit's CI next to the existing gvedit job.
-3. Release 0.2.0 of guterm. Add `release-check`, set the header and the
-   manual to 0.2.0, bring the README status up to date, tag, and run
-   `make guterm-sync` in vedit against the tag. The push is yours.
-
 ## Verification gaps
 
+- gvedit on a real high density display. Auto scale (`gut_desc.scale`
+  of 0) has only exercised the 1x branch, since Xvfb reports a content
+  scale of 1.0.
 - Windows and macOS on real hardware. Wine covers the Windows code path
   (GL loader, context fallback, SDL input) but not real drivers, the
   Windows IME, controllers through the Windows backend, or clipboard
@@ -96,7 +59,3 @@ Phases (in the vedit checkout for 1 and 2, both done):
 - Scrollback search, or a host API to read scrollback lines rather than
   only view them.
 - Answering OSC 52 queries in the shell example, behind a setting.
-
-## Process
-
-- A release tag and version bump process: phase 4 above.

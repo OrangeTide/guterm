@@ -8,6 +8,7 @@
 #   all      examples and tests
 #   test     unit tests and a short torture run
 #   configs  compile the header with each feature left out
+#   release-check  the header, manual, tag and tree agree for a release
 #   torture  longer torture run (TORTURE_ITER and TORTURE_SEED)
 #   asan     tests under address sanitizer
 #   ubsan    tests under undefined behavior sanitizer
@@ -37,7 +38,7 @@ ASAN_FLAGS := -O1 -g -fsanitize=address -fno-omit-frame-pointer
 UBSAN_FLAGS := -O1 -g -fsanitize=undefined -fno-sanitize-recover=all
 COV_FLAGS := -O0 -g --coverage
 
-.PHONY: all test configs torture asan ubsan cov clean
+.PHONY: all test configs torture asan ubsan cov release-check clean
 
 all: $(EXAMPLES) $(TESTS)
 
@@ -122,6 +123,30 @@ cov: $(OUT)/cov/test_vt $(OUT)/cov/torture
 	    awk '/^File .*guterm\.h/ {f = 1; next} f {print; exit}'
 	mv *.gcov $(OUT)/cov/
 	@echo "line report: $(OUT)/cov/guterm.h.gcov"
+
+# A release is the version in guterm.h, repeated by the manual, tagged as
+# v<version> at HEAD on a clean tree. Cut one with: set GUT_VERSION and
+# the manual line, commit "version x.y.z", tag -a vx.y.z, then run this.
+release-check:
+	@v=$$(sed -n 's/^#define GUT_VERSION "\(.*\)"/\1/p' guterm.h); \
+	m=$$(sed -n 's/^This manual covers version \([0-9.]*\) of.*/\1/p' guterm.md); \
+	if [ -z "$$v" ]; then \
+	    echo "release-check: no GUT_VERSION in guterm.h" >&2; exit 1; \
+	fi; \
+	if [ "$$m" != "$$v" ]; then \
+	    echo "release-check: guterm.md says '$$m', guterm.h says $$v" >&2; \
+	    exit 1; \
+	fi; \
+	if ! git rev-parse --verify --quiet "refs/tags/v$$v" >/dev/null; then \
+	    echo "release-check: no tag v$$v" >&2; exit 1; \
+	fi; \
+	if [ "$$(git rev-parse "v$$v^{commit}")" != "$$(git rev-parse HEAD)" ]; then \
+	    echo "release-check: tag v$$v is not at HEAD" >&2; exit 1; \
+	fi; \
+	if [ -n "$$(git status --porcelain)" ]; then \
+	    echo "release-check: working tree is dirty" >&2; exit 1; \
+	fi; \
+	echo "release-check: v$$v ok"
 
 clean:
 	rm -rf $(OUT)
