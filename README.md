@@ -140,7 +140,7 @@ Windows and macOS are expected to take.
 
 Not yet done:
 
-- OSC 52, the kitty keyboard protocol and XTWINOPS in the VT layer.
+- The kitty keyboard protocol and XTWINOPS in the VT layer.
 - Blink is accepted but drawn as normal text.
 - Combining characters are dropped; wide characters use two cells but
   the built-in font has no CJK glyphs, so they draw as `?`.

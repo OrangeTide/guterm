@@ -794,6 +794,116 @@ test_selection(void)
     gut_buf_free(&b);
 }
 
+
+static char clip_text[2][4096];
+static size_t clip_len[2];
+static int clip_calls;
+
+static void
+clip_set(void *ctx, int which, const char *text, size_t len)
+{
+    (void)ctx;
+    clip_calls++;
+    if (which < 0 || which > 1)
+        return;
+    clip_len[which] = len;
+    snprintf(clip_text[which], sizeof(clip_text[which]), "%s", text);
+}
+
+static const char *
+clip_get(void *ctx, int which)
+{
+    (void)ctx;
+    return which == GUT_CLIP_CLIPBOARD ? "hi" : NULL;
+}
+
+static void
+test_osc52(void)
+{
+    struct gut_buf b;
+    struct gut_vt vt;
+    char *big;
+
+    gut_buf_init(&b, 3, 10);
+    gut_vt_init(&vt, &b);
+    gut_vt_set_reply(&vt, reply_cb, NULL);
+    gut_vt_set_title_cb(&vt, title_cb, NULL);
+    last_reply[0] = '\0';
+
+    /* no callback: nothing happens, no reply */
+    feed(&vt, "\033]52;c;aGVsbG8=\a\033]52;c;?\a");
+    CHECK(clip_calls == 0 && last_reply[0] == '\0');
+
+    gut_vt_set_clipboard_cb(&vt, clip_set, NULL, NULL);
+    feed(&vt, "\033]52;c;aGVsbG8=\a");
+    CHECK(clip_calls == 1 && clip_len[0] == 5 &&
+          strcmp(clip_text[0], "hello") == 0);
+    /* ST terminator, primary, whitespace inside the base64 */
+    feed(&vt, "\033]52;p;d29y\nbGQ=\033\\");
+    CHECK(clip_calls == 2 && strcmp(clip_text[1], "world") == 0);
+    /* empty selection list means primary; both at once */
+    feed(&vt, "\033]52;;eA==\a");
+    CHECK(clip_calls == 3 && strcmp(clip_text[1], "x") == 0);
+    feed(&vt, "\033]52;cp;eQ==\a");
+    CHECK(clip_calls == 5 && strcmp(clip_text[0], "y") == 0 &&
+          strcmp(clip_text[1], "y") == 0);
+    /* unknown selection letters are ignored, repeated ones once */
+    feed(&vt, "\033]52;qcc;eg==\a");
+    CHECK(clip_calls == 6 && strcmp(clip_text[0], "z") == 0);
+    /* not base64 clears */
+    feed(&vt, "\033]52;c;not*base64\a");
+    CHECK(clip_calls == 7 && clip_len[0] == 0 && clip_text[0][0] == '\0');
+    /* NUL and binary survive */
+    feed(&vt, "\033]52;c;AGE=\a");
+    CHECK(clip_calls == 8 && clip_len[0] == 2 && clip_text[0][0] == '\0');
+    /* missing data part is ignored */
+    feed(&vt, "\033]52;c\a");
+    CHECK(clip_calls == 8);
+
+    /* queries only answer with a getter */
+    feed(&vt, "\033]52;c;?\a");
+    CHECK(last_reply[0] == '\0');
+    gut_vt_set_clipboard_cb(&vt, clip_set, clip_get, NULL);
+    feed(&vt, "\033]52;c;?\a");
+    CHECK(strcmp(last_reply, "\033]52;c;aGk=\033\\") == 0);
+    last_reply[0] = '\0';
+    feed(&vt, "\033]52;pc;?\a");
+    CHECK(strcmp(last_reply, "\033]52;pc;aGk=\033\\") == 0);
+    last_reply[0] = '\0';
+    feed(&vt, "\033]52;p;?\a");
+    CHECK(strcmp(last_reply, "\033]52;p;\033\\") == 0);
+    last_reply[0] = '\0';
+
+    /* a payload past the old fixed buffer size arrives whole */
+    big = malloc(16384);
+    memcpy(big, "\033]52;c;", 7);
+    for (int i = 0; i < 3000; i++)
+        memcpy(big + 7 + i * 4, "YWJj", 4);
+    big[7 + 3000 * 4] = '\a';
+    gut_vt_feed(&vt, big, 7 + 3000 * 4 + 1);
+    CHECK(clip_calls == 9 && clip_len[0] == 9000 &&
+          strncmp(clip_text[0], "abcabcabc", 9) == 0);
+    free(big);
+
+    /* a string past the limit is dropped, and the next one works */
+    big = malloc(GUT_VT_OSC_MAX + 16);
+    memset(big, 'A', GUT_VT_OSC_MAX + 16);
+    memcpy(big, "\033]52;c;", 7);
+    big[GUT_VT_OSC_MAX + 15] = '\a';
+    gut_vt_feed(&vt, big, GUT_VT_OSC_MAX + 16);
+    CHECK(clip_calls == 9 && vt.state == GUT_ST_GROUND);
+    free(big);
+    feed(&vt, "\033]52;c;b2s=\a");
+    CHECK(clip_calls == 10 && strcmp(clip_text[0], "ok") == 0);
+
+    /* an empty OSC and the title still work */
+    feed(&vt, "\033]\a\033]2;t\a");
+    CHECK(strcmp(last_title, "t") == 0);
+
+    gut_vt_free(&vt);
+    gut_buf_free(&b);
+}
+
 int
 main(void)
 {
@@ -807,6 +917,7 @@ main(void)
     test_mouse_encode();
     test_vt_mouse();
     test_selection();
+    test_osc52();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

@@ -72,6 +72,21 @@ on_title(void *ctx, const char *title)
     gut_set_title(a->w, title);
 }
 
+/* OSC 52: programs such as tmux and vim copy through the terminal.
+ * Only the store direction is wired; answering queries would let a
+ * program read the clipboard. */
+static void
+on_clipboard(void *ctx, int which, const char *text, size_t len)
+{
+    struct app *a = ctx;
+
+    (void)len;
+    if (which == GUT_CLIP_CLIPBOARD)
+        gut_clipboard_set(a->w, text);
+    else
+        gut_primary_set(a->w, text);
+}
+
 static int
 spawn_shell(struct app *a, int rows, int cols)
 {
@@ -268,6 +283,7 @@ main(void)
     gut_vt_init(&a.vt, &a.buf);
     gut_vt_set_reply(&a.vt, on_reply, &a);
     gut_vt_set_title_cb(&a.vt, on_title, &a);
+    gut_vt_set_clipboard_cb(&a.vt, on_clipboard, NULL, &a);
     if (spawn_shell(&a, desc.rows, desc.cols) != 0)
         return 1;
     signal(SIGCHLD, SIG_DFL);

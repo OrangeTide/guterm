@@ -930,13 +930,16 @@ Tabs: HTS, TBC for one stop and for all.
 Reports: DA1 answers as a VT100 with advanced video, DSR 5 and 6 answer
 status and cursor position. RIS performs a full reset.
 
-OSC 0 and 2 set the title. Other OSC, all DCS, APC, PM and SOS strings,
-and unknown CSI and ESC sequences are consumed and ignored, so a program
+OSC 0 and 2 set the title and OSC 52 reaches the clipboard, both
+through callbacks. Other OSC, all DCS, APC, PM and SOS strings, and
+unknown CSI and ESC sequences are consumed and ignored, so a program
 that emits sequences the emulator does not know still displays sanely.
+An OSC string is kept up to `GUT_VT_OSC_MAX`, one mebibyte; a longer
+one is dropped whole.
 
-Not implemented: OSC 52 clipboard,
-kitty keyboard protocol, XTWINOPS, character set designations other than
-ASCII and line drawing, and combining characters, which are dropped.
+Not implemented: kitty keyboard protocol, XTWINOPS, character set
+designations other than ASCII and line drawing, and combining
+characters, which are dropped.
 
 ### Callbacks
 
@@ -959,6 +962,35 @@ unanswered, which well behaved programs treat as unsupported.
 The title callback receives the string from OSC 0 or 2; passing it to
 `gut_set_title()` is the usual action. The bell callback fires on BEL and
 does nothing by itself.
+
+### OSC 52 clipboard
+
+```c
+void gut_vt_set_clipboard_cb(struct gut_vt *vt,
+                             void (*set)(void *ctx, int which,
+                                         const char *text, size_t len),
+                             const char *(*get)(void *ctx, int which),
+                             void *ctx);
+```
+
+Programs such as tmux, vim and the `clip` helpers copy through the
+terminal with `OSC 52 ; Pc ; Pd`. `Pc` names the selections, `c` for
+the clipboard and `p` or `s` for the primary selection, empty meaning
+primary; `Pd` is the text in base64. The emulator decodes it and calls
+`set` once per named selection with `which` as `GUT_CLIP_CLIPBOARD` or
+`GUT_CLIP_PRIMARY` and the text NUL terminated, so the host can pass it
+to `gut_clipboard_set()` or `gut_primary_set()`. Text that is not
+base64 arrives empty, which xterm treats as clearing. The text may
+contain NUL bytes, which is why `len` is given.
+
+A `Pd` of `?` is a query. When a `get` callback is set, the emulator
+replies through the reply callback with `OSC 52 ; Pc ; base64 ST`,
+taking the text from the first named selection that has any. Without
+`get` the query is ignored. That is the safe default and what
+`examples/term.c` does: answering lets any program running in the
+terminal read whatever the user copied elsewhere, so a host should
+enable it knowingly, as xterm's `allowWindowOps` and other terminals'
+settings do.
 
 ### Modes and the encoder
 
@@ -1031,6 +1063,9 @@ The shape of a program that runs a shell, from `examples/term.c`:
    the host's drives the selection; a finished drag sets the primary
    selection and Ctrl+Shift+C copies to the clipboard. Focus events go
    through it too.
+7. The OSC 52 callback stores what the child copies into the system
+   clipboard or primary selection; no `get` callback is given, so the
+   child cannot read them.
 
 ## 13. Threads, blocking and other event sources
 
@@ -1168,4 +1203,4 @@ VT, no dependencies: `gut_vt_init`, `gut_vt_free`, `gut_vt_reset`,
 `gut_vt_set_scrollback`, `gut_vt_scrollback_lines`,
 `gut_vt_clear_scrollback`, `gut_vt_set_view`, `gut_vt_scroll_view`,
 `gut_vt_view_offset`, `gut_vt_set_reply`, `gut_vt_set_title_cb`,
-`gut_vt_set_bell_cb`.
+`gut_vt_set_bell_cb`, `gut_vt_set_clipboard_cb`.

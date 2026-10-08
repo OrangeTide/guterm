@@ -104,8 +104,10 @@ check_vt(const struct gut_vt *vt)
         FAIL("parser state %d", vt->state);
     if (vt->nparam < 0 || vt->nparam > GUT_VT_MAX_PARAMS)
         FAIL("nparam %d", vt->nparam);
-    if (vt->osc_len >= GUT_VT_OSC_MAX)
-        FAIL("osc_len %lu", (unsigned long)vt->osc_len);
+    if (vt->osc_len >= GUT_VT_OSC_MAX || vt->osc_len > vt->osc_cap ||
+        (vt->osc_len > 0 && !vt->osc))
+        FAIL("osc_len %lu cap %lu", (unsigned long)vt->osc_len,
+             (unsigned long)vt->osc_cap);
     if (vt->utf8_len < 0 || vt->utf8_len > 4 || vt->utf8_need > 4)
         FAIL("utf8 state %d/%d", vt->utf8_len, vt->utf8_need);
     if (vt->charset < 0 || vt->charset > 1)
@@ -185,9 +187,26 @@ gen_escape(unsigned char *out, size_t cap)
         int len = rnd_range(0, 24);
 
         out[n++] = ']';
-        n += (size_t)snprintf((char *)out + n, cap - n, "%d;",
-                              rnd_range(0, 3) == 0 ? rnd_range(0, 9999)
-                                                   : rnd_range(0, 2));
+        if (rnd_range(0, 2) == 0) {
+            /* OSC 52: a selection list and base64, a query or junk */
+            n += (size_t)snprintf((char *)out + n, cap - n, "52;%s;",
+                                  (const char *[]){ "", "c", "p", "s0",
+                                                    "cp", "x" }
+                                  [rnd_range(0, 5)]);
+            if (rnd_range(0, 3) == 0) {
+                out[n++] = '?';
+                len = 0;
+            }
+            for (int i = 0; i < len; i++)
+                out[n++] = (unsigned char)
+                    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+                    "0123456789+/=\n*"[rnd_range(0, 67)];
+            len = 0;
+        } else {
+            n += (size_t)snprintf((char *)out + n, cap - n, "%d;",
+                                  rnd_range(0, 3) == 0 ? rnd_range(0, 9999)
+                                                       : rnd_range(0, 2));
+        }
         for (int i = 0; i < len; i++)
             out[n++] = (unsigned char)rnd_range(0x20, 0x7E);
         if (rnd_range(0, 1)) {
@@ -292,6 +311,23 @@ title_sink(void *ctx, const char *title)
 }
 
 static void
+clip_sink(void *ctx, int which, const char *text, size_t len)
+{
+    (void)ctx;
+    if (which != GUT_CLIP_CLIPBOARD && which != GUT_CLIP_PRIMARY)
+        FAIL("clipboard selection %d", which);
+    if (text[len] != '\0')
+        FAIL("clipboard text not terminated at %lu", (unsigned long)len);
+}
+
+static const char *
+clip_source(void *ctx, int which)
+{
+    (void)ctx;
+    return which == GUT_CLIP_CLIPBOARD ? "clip \xe6\xbc\xa2 text" : NULL;
+}
+
+static void
 torture_vt(unsigned long iterations)
 {
     struct gut_buf b;
@@ -301,6 +337,7 @@ torture_vt(unsigned long iterations)
     gut_vt_init(&vt, &b);
     gut_vt_set_reply(&vt, reply_sink, NULL);
     gut_vt_set_title_cb(&vt, title_sink, NULL);
+    gut_vt_set_clipboard_cb(&vt, clip_sink, clip_source, NULL);
 
     for (iter = 0; iter < iterations; iter++) {
         size_t len;

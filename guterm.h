@@ -526,7 +526,11 @@ GUT_API const char *gut_error(void);
 #define GUT_VT_MODE_FOCUS        (1u << 9)
 
 #define GUT_VT_MAX_PARAMS 16
-#define GUT_VT_OSC_MAX    1024
+#define GUT_VT_OSC_MAX    (1 << 20)   /* longest OSC string kept */
+
+/* OSC 52 selections */
+#define GUT_CLIP_CLIPBOARD 0
+#define GUT_CLIP_PRIMARY   1
 #define GUT_VT_SCROLLBACK_DEFAULT 1000
 
 struct gut_vt_saved {
@@ -580,8 +584,9 @@ struct gut_vt {
     int cur_param;
     int has_digit;
     int intermed;
-    char osc[GUT_VT_OSC_MAX];
-    size_t osc_len;
+    char *osc;                  /* grows up to GUT_VT_OSC_MAX */
+    size_t osc_len, osc_cap;
+    int osc_overflow;           /* string too long: dropped at the end */
     unsigned char utf8_buf[4];
     int utf8_len, utf8_need;
 
@@ -592,6 +597,9 @@ struct gut_vt {
     void *title_ctx;
     void (*bell)(void *ctx);
     void *bell_ctx;
+    void (*clip_set)(void *ctx, int which, const char *text, size_t len);
+    const char *(*clip_get)(void *ctx, int which);
+    void *clip_ctx;
 };
 
 /** Attach the emulator to buf and reset it. Returns 0 or -1. */
@@ -657,6 +665,21 @@ GUT_API void gut_vt_set_title_cb(struct gut_vt *vt,
                                  void *ctx);
 GUT_API void gut_vt_set_bell_cb(struct gut_vt *vt, void (*fn)(void *ctx),
                                 void *ctx);
+
+/** OSC 52, the program's access to the clipboard. set receives the
+ * decoded text, NUL terminated, for GUT_CLIP_CLIPBOARD or
+ * GUT_CLIP_PRIMARY; an empty text means clear. get answers a query
+ * with the current text, or NULL for none, valid until it returns; the
+ * reply goes through the reply callback. Either may be NULL: with no
+ * get, queries are ignored, which is the safe default since a query
+ * lets the program read what the user copied elsewhere. */
+GUT_API void gut_vt_set_clipboard_cb(struct gut_vt *vt,
+                                     void (*set)(void *ctx, int which,
+                                                 const char *text,
+                                                 size_t len),
+                                     const char *(*get)(void *ctx,
+                                                        int which),
+                                     void *ctx);
 
 #endif /* GUTERM_NO_VT */
 
@@ -4481,15 +4504,148 @@ gut_vt_esc(struct gut_vt *vt, int final)
 
 /* ---- OSC ---- */
 
+static const char gut_b64_chars[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static int
+gut_b64_value(char c)
+{
+    const char *p = c ? strchr(gut_b64_chars, c) : NULL;
+
+    return p ? (int)(p - gut_b64_chars) : -1;
+}
+
+/* Decode into out (at least 3 * len / 4 + 1 bytes), ignoring
+ * whitespace. Returns the length, NUL terminated, or -1 when the input
+ * is not base64. */
+static long
+gut_b64_decode(const char *in, size_t len, char *out)
+{
+    unsigned acc = 0;
+    int bits = 0;
+    long n = 0;
+
+    for (size_t i = 0; i < len; i++) {
+        int v;
+
+        if (in[i] == '=' )
+            break;
+        if (in[i] == ' ' || in[i] == '\n' || in[i] == '\r' ||
+            in[i] == '\t')
+            continue;
+        v = gut_b64_value(in[i]);
+        if (v < 0)
+            return -1;
+        acc = (acc << 6) | (unsigned)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out[n++] = (char)((acc >> bits) & 0xFF);
+        }
+    }
+    out[n] = '\0';
+    return n;
+}
+
+/* Encode len bytes; out needs 4 * ((len + 2) / 3) + 1 bytes. */
+static size_t
+gut_b64_encode(const unsigned char *in, size_t len, char *out)
+{
+    size_t n = 0;
+
+    for (size_t i = 0; i < len; i += 3) {
+        unsigned v = (unsigned)in[i] << 16;
+        size_t rest = len - i;
+
+        if (rest > 1)
+            v |= (unsigned)in[i + 1] << 8;
+        if (rest > 2)
+            v |= in[i + 2];
+        out[n++] = gut_b64_chars[(v >> 18) & 63];
+        out[n++] = gut_b64_chars[(v >> 12) & 63];
+        out[n++] = rest > 1 ? gut_b64_chars[(v >> 6) & 63] : '=';
+        out[n++] = rest > 2 ? gut_b64_chars[v & 63] : '=';
+    }
+    out[n] = '\0';
+    return n;
+}
+
+/* OSC 52 ; Pc ; Pd : Pc names selections, c clipboard and p or s
+ * primary, empty meaning primary; Pd is base64 text to store, ? to
+ * query, anything else clears. */
+static void
+gut_vt_osc52(struct gut_vt *vt, const char *arg, size_t len)
+{
+    const char *semi = memchr(arg, ';', len);
+    const char *pc = arg, *pd;
+    size_t pc_len, pd_len;
+    int which[2], nwhich = 0;
+
+    if (!semi)
+        return;
+    pc_len = (size_t)(semi - arg);
+    pd = semi + 1;
+    pd_len = len - pc_len - 1;
+    for (size_t i = 0; i < pc_len && nwhich < 2; i++) {
+        int w = pc[i] == 'c' ? GUT_CLIP_CLIPBOARD
+              : pc[i] == 'p' || pc[i] == 's' ? GUT_CLIP_PRIMARY : -1;
+
+        if (w >= 0 && !(nwhich == 1 && which[0] == w))
+            which[nwhich++] = w;
+    }
+    if (nwhich == 0)
+        which[nwhich++] = GUT_CLIP_PRIMARY;
+
+    if (pd_len == 1 && pd[0] == '?') {
+        const char *text = NULL;
+        size_t tlen;
+        char *reply;
+        size_t n;
+
+        if (!vt->clip_get || !vt->reply)
+            return;
+        for (int i = 0; i < nwhich && !text; i++)
+            text = vt->clip_get(vt->clip_ctx, which[i]);
+        if (!text)
+            text = "";
+        tlen = strlen(text);
+        reply = malloc(pc_len + 4 * ((tlen + 2) / 3) + 16);
+        if (!reply)
+            return;
+        n = (size_t)snprintf(reply, pc_len + 8, "\033]52;%.*s;",
+                             (int)pc_len, pc);
+        n += gut_b64_encode((const unsigned char *)text, tlen, reply + n);
+        memcpy(reply + n, "\033\\", 2);
+        gut_vt_reply_str(vt, reply, n + 2);
+        free(reply);
+        return;
+    }
+    if (vt->clip_set) {
+        char *text = malloc(3 * (pd_len / 4) + 4);
+        long n;
+
+        if (!text)
+            return;
+        n = gut_b64_decode(pd, pd_len, text);
+        if (n < 0) {
+            n = 0;
+            text[0] = '\0';
+        }
+        for (int i = 0; i < nwhich; i++)
+            vt->clip_set(vt->clip_ctx, which[i], text, (size_t)n);
+        free(text);
+    }
+}
+
 static void
 gut_vt_osc(struct gut_vt *vt)
 {
     const char *data = vt->osc;
     size_t len = vt->osc_len;
-    const char *semi = memchr(data, ';', len);
+    const char *semi = data ? memchr(data, ';', len) : NULL;
     int num = 0;
 
-    if (!semi)
+    if (!data || !semi)
         return;
     for (const char *p = data; p < semi; p++) {
         if (*p < '0' || *p > '9')
@@ -4497,11 +4653,38 @@ gut_vt_osc(struct gut_vt *vt)
         num = num * 10 + (*p - '0');
     }
     semi++;
-    if ((num == 0 || num == 2) && vt->title) {
-        /* osc has a spare byte: osc_len stays below GUT_VT_OSC_MAX */
-        vt->osc[len] = '\0';
+    if (vt->osc_overflow)
+        return;
+    vt->osc[len] = '\0';    /* the buffer keeps a spare byte */
+    if ((num == 0 || num == 2) && vt->title)
         vt->title(vt->title_ctx, semi);
+    else if (num == 52)
+        gut_vt_osc52(vt, semi, len - (size_t)(semi - data));
+}
+
+/* Append to the OSC string, growing the buffer up to the limit. */
+static void
+gut_vt_osc_put(struct gut_vt *vt, char c)
+{
+    if (vt->osc_overflow)
+        return;
+    if (vt->osc_len + 1 >= vt->osc_cap) {
+        size_t cap = vt->osc_cap ? vt->osc_cap * 2 : 256;
+        char *p;
+
+        if (vt->osc_len + 1 >= GUT_VT_OSC_MAX) {
+            vt->osc_overflow = 1;
+            return;
+        }
+        p = realloc(vt->osc, cap);
+        if (!p) {
+            vt->osc_overflow = 1;
+            return;
+        }
+        vt->osc = p;
+        vt->osc_cap = cap;
     }
+    vt->osc[vt->osc_len++] = c;
 }
 
 /* ---- parser ---- */
@@ -4599,6 +4782,7 @@ gut_vt_byte(struct gut_vt *vt, unsigned char c)
             vt->state = GUT_ST_CSI_ENTRY;
         } else if (c == ']') {
             vt->osc_len = 0;
+            vt->osc_overflow = 0;
             vt->state = GUT_ST_OSC_STRING;
         } else if (c == 'P' || c == 'X' || c == '^' || c == '_') {
             vt->state = GUT_ST_DCS_PASSTHRU;
@@ -4686,8 +4870,8 @@ gut_vt_byte(struct gut_vt *vt, unsigned char c)
         if (c == 0x07) {
             gut_vt_osc(vt);
             vt->state = GUT_ST_GROUND;
-        } else if (vt->osc_len + 1 < GUT_VT_OSC_MAX) {
-            vt->osc[vt->osc_len++] = (char)c;
+        } else {
+            gut_vt_osc_put(vt, (char)c);
         }
         break;
     }
@@ -4770,12 +4954,16 @@ gut_vt_free(struct gut_vt *vt)
         gut_buf_free(&vt->live);
     free(vt->tabstops);
     free(vt->alt_saved);
+    free(vt->osc);
     vt->sb = NULL;
     vt->sb_cap = 0;
     vt->view = 0;
     vt->buf = vt->out;
     vt->tabstops = NULL;
     vt->alt_saved = NULL;
+    vt->osc = NULL;
+    vt->osc_cap = 0;
+    vt->osc_len = 0;
 }
 
 /* Lines above the cursor move into the scrollback when the screen
@@ -5017,6 +5205,17 @@ gut_vt_set_bell_cb(struct gut_vt *vt, void (*fn)(void *ctx), void *ctx)
 {
     vt->bell = fn;
     vt->bell_ctx = ctx;
+}
+
+void
+gut_vt_set_clipboard_cb(struct gut_vt *vt,
+                        void (*set)(void *ctx, int which, const char *text,
+                                    size_t len),
+                        const char *(*get)(void *ctx, int which), void *ctx)
+{
+    vt->clip_set = set;
+    vt->clip_get = get;
+    vt->clip_ctx = ctx;
 }
 
 #endif /* GUTERM_NO_VT */
