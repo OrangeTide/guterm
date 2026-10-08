@@ -568,6 +568,60 @@ struct gut_vt_saved {
     struct gut_color fg, bg;
 };
 
+/* ---- images ---- */
+
+/** A decoded picture: w by h pixels of RGBA, row major, 4 bytes each,
+ * alpha 0 where nothing was painted. */
+struct gut_image {
+    int w, h;
+    uint8_t *rgba;
+};
+
+GUT_API void gut_image_free(struct gut_image *img);
+
+#define GUT_SIXEL_COLORS 256
+#define GUT_VT_IMAGE_MAX_PIXELS (1 << 22)   /* 2048 by 2048 */
+
+/* Streaming sixel decoder. The bytes between DCS q and ST go in one at
+ * a time, so a picture is never buffered as text before it is decoded.
+ * The canvas grows as the pen moves and is bounded by max_pixels: a
+ * picture that would exceed it is dropped and the rest of its data is
+ * ignored. The pixel aspect ratio in the DCS parameters is ignored;
+ * the one in the raster attributes stretches the picture vertically. */
+struct gut_sixel {
+    uint8_t *rgba;
+    int w, h;                   /* canvas allocated */
+    int max_w, max_h;           /* extent painted or asked for */
+    size_t max_pixels;
+    uint32_t palette[GUT_SIXEL_COLORS];  /* 0xRRGGBB */
+    int color;
+    int x, y;                   /* pen column and top of the sixel band */
+    int vstretch;               /* rows per sixel bit, from the aspect */
+    int opaque;                 /* P2 != 1: unpainted pixels get color 0 */
+    int cmd;                    /* '"', '#' or '!' while collecting */
+    int params[5];
+    int nparam;
+    int cur_param;
+    int has_digit;
+    int repeat;
+    int active;
+    int failed;
+};
+
+/** Start a picture with the DCS parameters P1 (aspect, ignored), P2
+ * (1 leaves unpainted pixels transparent, anything else fills them with
+ * color 0) and P3 (ignored). max_pixels bounds the canvas, 0 for the
+ * default. The struct must be zeroed before its first use; afterwards a
+ * begin discards whatever the last picture left. */
+GUT_API void gut_sixel_begin(struct gut_sixel *s, int p1, int p2, int p3,
+                             size_t max_pixels);
+GUT_API void gut_sixel_put(struct gut_sixel *s, unsigned char c);
+/** Finish the picture. Returns 1 with out filled, which the caller frees
+ * with gut_image_free, or 0 when nothing was painted or the picture was
+ * over the limit. The decoder is idle afterwards either way. */
+GUT_API int gut_sixel_end(struct gut_sixel *s, struct gut_image *out);
+GUT_API void gut_sixel_abort(struct gut_sixel *s);
+
 /* One scrollback line: the cells up to the last non-blank one. */
 struct gut_vt_line {
     struct gut_cell *cells;
@@ -618,6 +672,8 @@ struct gut_vt {
     int osc_overflow;           /* string too long: dropped at the end */
     unsigned char utf8_buf[4];
     int utf8_len, utf8_need;
+    struct gut_sixel sixel;     /* picture being decoded */
+    size_t image_max_pixels;
 
     /* callbacks */
     void (*reply)(void *ctx, const char *data, size_t len);
@@ -663,6 +719,10 @@ GUT_API size_t gut_vt_mouse(struct gut_vt *vt, const struct gut_event *ev,
 /** Set how many lines the scrollback keeps, 0 to disable. The newest
  * lines survive a shrink. Returns 0 or -1. */
 GUT_API int gut_vt_set_scrollback(struct gut_vt *vt, int lines);
+
+/** Largest picture the sixel decoder will build, in pixels; a larger
+ * one is dropped. 0 restores GUT_VT_IMAGE_MAX_PIXELS. */
+GUT_API void gut_vt_set_image_limit(struct gut_vt *vt, size_t max_pixels);
 
 /** Lines currently held in the scrollback. */
 GUT_API int gut_vt_scrollback_lines(const struct gut_vt *vt);
@@ -724,6 +784,7 @@ GUT_API void gut_vt_set_clipboard_cb(struct gut_vt *vt,
 
 #ifdef GUTERM_IMPLEMENTATION
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -3816,6 +3877,8 @@ enum {
     GUT_ST_CSI_INTERMED,
     GUT_ST_CSI_IGNORE,
     GUT_ST_OSC_STRING,
+    GUT_ST_DCS_PARAM,
+    GUT_ST_DCS_SIXEL,
     GUT_ST_DCS_PASSTHRU,
 };
 
@@ -3826,6 +3889,349 @@ static const uint32_t gut_dec_graphics[] = {
     0x23BA, 0x23BB, 0x2500, 0x23BC, 0x23BD, 0x251C, 0x2524, 0x2534,
     0x252C, 0x2502, 0x2264, 0x2265, 0x03C0, 0x2260, 0x00A3, 0x00B7,
 };
+
+/* ---- sixel decoder ---- */
+
+/* VT340 default colors, in percent. */
+static const uint8_t gut_sixel_default[16][3] = {
+    { 0, 0, 0 },    { 20, 20, 80 }, { 80, 13, 13 }, { 20, 80, 20 },
+    { 80, 20, 80 }, { 20, 80, 80 }, { 80, 80, 20 }, { 53, 53, 53 },
+    { 26, 26, 26 }, { 33, 33, 60 }, { 60, 26, 26 }, { 33, 60, 33 },
+    { 60, 33, 60 }, { 33, 60, 60 }, { 60, 60, 33 }, { 80, 80, 80 },
+};
+
+static double
+gut_fabs(double v)
+{
+    return v < 0 ? -v : v;
+}
+
+static int
+gut_pct(int v)
+{
+    if (v < 0)
+        v = 0;
+    if (v > 100)
+        v = 100;
+    return (v * 255 + 50) / 100;
+}
+
+/* Sixel HLS has blue at 0, red at 120 and green at 240, which is the
+ * usual HSL wheel turned by 240 degrees. */
+static uint32_t
+gut_hls_to_rgb(int h, int l, int s)
+{
+    double hue, chroma, second, m, rgb[3];
+    int sector;
+
+    h = ((h % 360) + 360 + 240) % 360;
+    l = l < 0 ? 0 : l > 100 ? 100 : l;
+    s = s < 0 ? 0 : s > 100 ? 100 : s;
+    hue = h / 60.0;
+    sector = (int)hue;
+    chroma = (1.0 - gut_fabs(2.0 * l / 100.0 - 1.0)) * s / 100.0;
+    second = chroma * (1.0 - gut_fabs(hue - 2.0 * (sector / 2) - 1.0));
+    m = l / 100.0 - chroma / 2.0;
+    switch (sector) {
+    case 0: rgb[0] = chroma; rgb[1] = second; rgb[2] = 0; break;
+    case 1: rgb[0] = second; rgb[1] = chroma; rgb[2] = 0; break;
+    case 2: rgb[0] = 0; rgb[1] = chroma; rgb[2] = second; break;
+    case 3: rgb[0] = 0; rgb[1] = second; rgb[2] = chroma; break;
+    case 4: rgb[0] = second; rgb[1] = 0; rgb[2] = chroma; break;
+    default: rgb[0] = chroma; rgb[1] = 0; rgb[2] = second; break;
+    }
+    return ((uint32_t)(int)((rgb[0] + m) * 255.0 + 0.5) << 16) |
+           ((uint32_t)(int)((rgb[1] + m) * 255.0 + 0.5) << 8) |
+           (uint32_t)(int)((rgb[2] + m) * 255.0 + 0.5);
+}
+
+void
+gut_image_free(struct gut_image *img)
+{
+    free(img->rgba);
+    img->rgba = NULL;
+    img->w = 0;
+    img->h = 0;
+}
+
+void
+gut_sixel_abort(struct gut_sixel *s)
+{
+    free(s->rgba);
+    s->rgba = NULL;
+    s->w = 0;
+    s->h = 0;
+    s->active = 0;
+}
+
+void
+gut_sixel_begin(struct gut_sixel *s, int p1, int p2, int p3,
+                size_t max_pixels)
+{
+    (void)p1;
+    (void)p3;
+    gut_sixel_abort(s);
+    s->max_w = 0;
+    s->max_h = 0;
+    s->max_pixels = max_pixels ? max_pixels : GUT_VT_IMAGE_MAX_PIXELS;
+    if (s->max_pixels > (size_t)INT_MAX / 8)
+        s->max_pixels = (size_t)INT_MAX / 8;  /* keeps pen arithmetic in int */
+    memset(s->palette, 0, sizeof(s->palette));
+    for (int i = 0; i < 16; i++)
+        s->palette[i] = ((uint32_t)gut_pct(gut_sixel_default[i][0]) << 16) |
+                        ((uint32_t)gut_pct(gut_sixel_default[i][1]) << 8) |
+                        (uint32_t)gut_pct(gut_sixel_default[i][2]);
+    s->color = 0;
+    s->x = 0;
+    s->y = 0;
+    s->vstretch = 1;
+    s->opaque = p2 != 1;
+    s->cmd = 0;
+    s->nparam = 0;
+    s->cur_param = 0;
+    s->has_digit = 0;
+    s->repeat = 1;
+    s->active = 1;
+    s->failed = 0;
+}
+
+/* Grow the canvas to hold need_w by need_h. Returns 0, or -1 when the
+ * picture would pass the limit, which fails the whole picture. */
+static int
+gut_sixel_ensure(struct gut_sixel *s, int need_w, int need_h)
+{
+    int nw = s->w, nh = s->h;
+    uint8_t *canvas;
+
+    if (need_w <= s->w && need_h <= s->h)
+        return 0;
+    if ((size_t)need_w * (size_t)need_h > s->max_pixels)
+        goto fail;
+    if (need_w > nw)
+        nw = (need_w + 63) & ~63;
+    if (need_h > nh)
+        nh = (need_h + 47) / 48 * 48;
+    if ((size_t)nw * (size_t)nh > s->max_pixels) {
+        nw = need_w > s->w ? need_w : s->w;
+        nh = need_h > s->h ? need_h : s->h;
+    }
+    canvas = calloc((size_t)nw * (size_t)nh, 4);
+    if (!canvas)
+        goto fail;
+    for (int r = 0; r < s->h; r++)
+        memcpy(canvas + (size_t)r * nw * 4, s->rgba + (size_t)r * s->w * 4,
+               (size_t)s->w * 4);
+    free(s->rgba);
+    s->rgba = canvas;
+    s->w = nw;
+    s->h = nh;
+    return 0;
+fail:
+    gut_sixel_abort(s);
+    s->failed = 1;
+    return -1;
+}
+
+static void
+gut_sixel_paint(struct gut_sixel *s, int bits)
+{
+    int n = s->repeat, vs = s->vstretch;
+    uint32_t rgb = s->palette[s->color];
+    int top = -1, bot = 0;
+
+    s->repeat = 1;
+    if (n <= 0)
+        return;
+    if (s->x > (int)s->max_pixels || s->y > (int)s->max_pixels ||
+        n > (int)s->max_pixels) {
+        gut_sixel_abort(s);
+        s->failed = 1;
+        return;
+    }
+    if (bits == 0) {
+        s->x += n;
+        if (s->x > s->max_w)
+            s->max_w = s->x;
+        return;
+    }
+    for (int b = 0; b < 6; b++) {
+        if (bits & (1 << b)) {
+            if (top < 0)
+                top = b;
+            bot = b;
+        }
+    }
+    if (gut_sixel_ensure(s, s->x + n, s->y + (bot + 1) * vs) != 0)
+        return;
+    for (int b = top; b <= bot; b++) {
+        if (!(bits & (1 << b)))
+            continue;
+        for (int dy = 0; dy < vs; dy++) {
+            uint8_t *p = s->rgba +
+                         ((size_t)(s->y + b * vs + dy) * s->w + s->x) * 4;
+
+            for (int i = 0; i < n; i++, p += 4) {
+                p[0] = (uint8_t)(rgb >> 16);
+                p[1] = (uint8_t)(rgb >> 8);
+                p[2] = (uint8_t)rgb;
+                p[3] = 255;
+            }
+        }
+    }
+    s->x += n;
+    if (s->x > s->max_w)
+        s->max_w = s->x;
+    if (s->y + (bot + 1) * vs > s->max_h)
+        s->max_h = s->y + (bot + 1) * vs;
+}
+
+static void
+gut_sixel_finish_param(struct gut_sixel *s)
+{
+    if (s->nparam < 5)
+        s->params[s->nparam++] = s->has_digit ? s->cur_param : 0;
+    s->cur_param = 0;
+    s->has_digit = 0;
+}
+
+/* The parameters of '"', '#' or '!' are complete: act on them. */
+static void
+gut_sixel_dispatch(struct gut_sixel *s)
+{
+    gut_sixel_finish_param(s);
+    switch (s->cmd) {
+    case '"':
+        /* Pan;Pad;Ph;Pv: the aspect stretches, the size is a floor for
+         * the picture and for the opaque fill */
+        if (s->nparam >= 2 && s->params[1] > 0 && s->params[0] > s->params[1]
+            && s->max_h == 0)
+            s->vstretch = (s->params[0] + s->params[1] / 2) / s->params[1];
+        if (s->nparam >= 4 && s->params[2] > 0 && s->params[3] > 0) {
+            if ((size_t)s->params[2] * (size_t)s->params[3] > s->max_pixels) {
+                gut_sixel_abort(s);
+                s->failed = 1;
+                break;
+            }
+            if (s->params[2] > s->max_w)
+                s->max_w = s->params[2];
+            if (s->params[3] > s->max_h)
+                s->max_h = s->params[3];
+        }
+        break;
+    case '#':
+        s->color = s->params[0] % GUT_SIXEL_COLORS;
+        if (s->nparam >= 5) {
+            if (s->params[1] == 1)
+                s->palette[s->color] = gut_hls_to_rgb(s->params[2],
+                                                      s->params[3],
+                                                      s->params[4]);
+            else if (s->params[1] == 2)
+                s->palette[s->color] =
+                    ((uint32_t)gut_pct(s->params[2]) << 16) |
+                    ((uint32_t)gut_pct(s->params[3]) << 8) |
+                    (uint32_t)gut_pct(s->params[4]);
+        }
+        break;
+    case '!':
+        s->repeat = s->params[0] > 0 ? s->params[0] : 1;
+        break;
+    }
+    s->cmd = 0;
+    s->nparam = 0;
+}
+
+void
+gut_sixel_put(struct gut_sixel *s, unsigned char c)
+{
+    if (!s->active || s->failed)
+        return;
+    if (s->cmd) {
+        if (c >= '0' && c <= '9') {
+            if (s->cur_param < 65535)
+                s->cur_param = s->cur_param * 10 + (c - '0');
+            s->has_digit = 1;
+            return;
+        }
+        if (c == ';') {
+            gut_sixel_finish_param(s);
+            return;
+        }
+        gut_sixel_dispatch(s);
+        if (s->failed)
+            return;
+    }
+    if (c == '"' || c == '#' || c == '!') {
+        s->cmd = c;
+        s->nparam = 0;
+        s->cur_param = 0;
+        s->has_digit = 0;
+    } else if (c == '$') {
+        s->x = 0;
+        s->repeat = 1;
+    } else if (c == '-') {
+        s->x = 0;
+        s->y += 6 * s->vstretch;
+        s->repeat = 1;
+        if (s->y > (int)s->max_pixels) {
+            gut_sixel_abort(s);
+            s->failed = 1;
+        }
+    } else if (c >= 0x3F && c <= 0x7E) {
+        gut_sixel_paint(s, c - 0x3F);
+    } else {
+        s->repeat = 1;
+    }
+}
+
+int
+gut_sixel_end(struct gut_sixel *s, struct gut_image *out)
+{
+    int w, h;
+
+    out->w = 0;
+    out->h = 0;
+    out->rgba = NULL;
+    if (!s->active || s->failed) {
+        gut_sixel_abort(s);
+        return 0;
+    }
+    if (s->cmd)
+        gut_sixel_dispatch(s);
+    w = s->max_w;
+    h = s->max_h;
+    if (w <= 0 || h <= 0 || s->failed ||
+        gut_sixel_ensure(s, w, h) != 0) {
+        gut_sixel_abort(s);
+        return 0;
+    }
+    /* repack to the final width when the canvas is wider */
+    if (s->w != w) {
+        for (int r = 1; r < h; r++)
+            memmove(s->rgba + (size_t)r * w * 4,
+                    s->rgba + (size_t)r * s->w * 4, (size_t)w * 4);
+    }
+    if (s->opaque) {
+        uint32_t rgb = s->palette[0];
+        uint8_t *p = s->rgba;
+
+        for (size_t i = 0; i < (size_t)w * (size_t)h; i++, p += 4) {
+            if (p[3] == 0) {
+                p[0] = (uint8_t)(rgb >> 16);
+                p[1] = (uint8_t)(rgb >> 8);
+                p[2] = (uint8_t)rgb;
+                p[3] = 255;
+            }
+        }
+    }
+    out->w = w;
+    out->h = h;
+    out->rgba = s->rgba;
+    s->rgba = NULL;
+    s->w = 0;
+    s->h = 0;
+    s->active = 0;
+    return 1;
+}
 
 /* ---- state helpers ---- */
 
@@ -4831,6 +5237,16 @@ gut_vt_osc_put(struct gut_vt *vt, char c)
 
 /* ---- parser ---- */
 
+/* The DCS ended: a finished picture is dropped until placement exists. */
+static void
+gut_vt_sixel_finish(struct gut_vt *vt)
+{
+    struct gut_image img;
+
+    if (gut_sixel_end(&vt->sixel, &img))
+        gut_image_free(&img);
+}
+
 static void
 gut_vt_csi_reset(struct gut_vt *vt)
 {
@@ -4900,6 +5316,8 @@ gut_vt_byte(struct gut_vt *vt, unsigned char c)
     if (c == 0x1B) {
         if (vt->state == GUT_ST_OSC_STRING)
             gut_vt_osc(vt);
+        if (vt->state == GUT_ST_DCS_SIXEL)
+            gut_vt_sixel_finish(vt);
         vt->utf8_need = 0;
         vt->utf8_len = 0;
         vt->state = GUT_ST_ESCAPE;
@@ -4907,7 +5325,7 @@ gut_vt_byte(struct gut_vt *vt, unsigned char c)
         return;
     }
     if (vt->state != GUT_ST_GROUND && vt->state != GUT_ST_OSC_STRING &&
-        vt->state != GUT_ST_DCS_PASSTHRU) {
+        vt->state != GUT_ST_DCS_PASSTHRU && vt->state != GUT_ST_DCS_SIXEL) {
         if (c == 0x07 || (c >= 0x08 && c <= 0x0D)) {
             gut_vt_execute(vt, c);
             return;
@@ -4926,7 +5344,10 @@ gut_vt_byte(struct gut_vt *vt, unsigned char c)
             vt->osc_len = 0;
             vt->osc_overflow = 0;
             vt->state = GUT_ST_OSC_STRING;
-        } else if (c == 'P' || c == 'X' || c == '^' || c == '_') {
+        } else if (c == 'P') {
+            gut_vt_csi_reset(vt);
+            vt->state = GUT_ST_DCS_PARAM;
+        } else if (c == 'X' || c == '^' || c == '_') {
             vt->state = GUT_ST_DCS_PASSTHRU;
         } else if (c >= 0x20 && c <= 0x2F) {
             vt->intermed = c;
@@ -5005,6 +5426,32 @@ gut_vt_byte(struct gut_vt *vt, unsigned char c)
         if (c >= 0x40 && c <= 0x7E)
             vt->state = GUT_ST_GROUND;
         break;
+    case GUT_ST_DCS_PARAM:
+        if (c >= '0' && c <= '9') {
+            if (vt->cur_param < 65535)
+                vt->cur_param = vt->cur_param * 10 + (c - '0');
+            vt->has_digit = 1;
+        } else if (c == ';') {
+            gut_vt_finish_param(vt);
+        } else if (c >= 0x20 && c <= 0x3F) {
+            vt->intermed = c;
+        } else if (c >= 0x40 && c <= 0x7E) {
+            gut_vt_finish_param(vt);
+            if (c == 'q' && vt->intermed == 0) {
+                gut_sixel_begin(&vt->sixel, gut_vt_param(vt, 0, 0),
+                                gut_vt_param(vt, 1, 0), gut_vt_param(vt, 2, 0),
+                                vt->image_max_pixels);
+                vt->state = GUT_ST_DCS_SIXEL;
+            } else {
+                vt->state = GUT_ST_DCS_PASSTHRU;
+            }
+        } else {
+            vt->state = GUT_ST_DCS_PASSTHRU;
+        }
+        break;
+    case GUT_ST_DCS_SIXEL:
+        gut_sixel_put(&vt->sixel, (unsigned char)c);
+        break;
     case GUT_ST_DCS_PASSTHRU:
         /* absorbed until ESC \ arrives; ESC is handled above */
         break;
@@ -5058,6 +5505,7 @@ gut_vt_reset(struct gut_vt *vt)
     vt->wrap_pending = 0;
     memset(&vt->saved, 0, sizeof(vt->saved));
     gut_vt_tab_reset(vt);
+    gut_sixel_abort(&vt->sixel);
     vt->state = GUT_ST_GROUND;
     vt->utf8_need = 0;
     vt->utf8_len = 0;
@@ -5075,6 +5523,7 @@ gut_vt_init(struct gut_vt *vt, struct gut_buf *buf)
     memset(vt, 0, sizeof(*vt));
     vt->buf = buf;
     vt->out = buf;
+    vt->image_max_pixels = GUT_VT_IMAGE_MAX_PIXELS;
     vt->tabstops = calloc((size_t)buf->cols, 1);
     if (!vt->tabstops)
         return -1;
@@ -5090,6 +5539,7 @@ gut_vt_init(struct gut_vt *vt, struct gut_buf *buf)
 void
 gut_vt_free(struct gut_vt *vt)
 {
+    gut_sixel_abort(&vt->sixel);
     gut_vt_sb_free_lines(vt);
     free(vt->sb);
     if (vt->view > 0)
@@ -5216,6 +5666,12 @@ gut_vt_set_scrollback(struct gut_vt *vt, int lines)
     if (vt->view > keep)
         gut_vt_view_apply(vt, keep);
     return 0;
+}
+
+void
+gut_vt_set_image_limit(struct gut_vt *vt, size_t max_pixels)
+{
+    vt->image_max_pixels = max_pixels ? max_pixels : GUT_VT_IMAGE_MAX_PIXELS;
 }
 
 int

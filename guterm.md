@@ -980,8 +980,14 @@ Reports: DA1 answers as a VT100 with advanced video, DSR 5 and 6 answer
 status and cursor position. RIS performs a full reset.
 
 OSC 0 and 2 set the title and OSC 52 reaches the clipboard, both
-through callbacks. Other OSC, all DCS, APC, PM and SOS strings, and
-unknown CSI and ESC sequences are consumed and ignored, so a program
+through callbacks. A sixel picture (DCS q) is decoded as it streams by
+`gut_sixel_begin`, `gut_sixel_put` and `gut_sixel_end`, which a program
+may also use on their own; the emulator does not yet place the result,
+so the picture is dropped. `gut_vt_set_image_limit` bounds a picture in
+pixels, `GUT_VT_IMAGE_MAX_PIXELS` by default, and a larger one is
+dropped and the rest of its data ignored. Other OSC, other DCS, APC, PM
+and SOS strings, and unknown CSI and ESC sequences are consumed and
+ignored, so a program
 that emits sequences the emulator does not know still displays sanely.
 An OSC string is kept up to `GUT_VT_OSC_MAX`, one mebibyte; a longer
 one is dropped whole.
@@ -1257,7 +1263,9 @@ Window, needs SDL3: `gut_open`, `gut_close`, `gut_error`, `gut_present`,
 VT, no dependencies: `gut_vt_init`, `gut_vt_free`, `gut_vt_reset`,
 `gut_vt_feed`, `gut_vt_resize`, `gut_vt_modes`, `gut_vt_encode_flags`,
 `gut_vt_mouse`,
-`gut_vt_set_scrollback`, `gut_vt_scrollback_lines`,
+`gut_vt_set_scrollback`, `gut_vt_scrollback_lines`, `gut_vt_set_image_limit`,
+`gut_sixel_begin`, `gut_sixel_put`, `gut_sixel_end`, `gut_sixel_abort`,
+`gut_image_free`,
 `gut_vt_clear_scrollback`, `gut_vt_set_view`, `gut_vt_scroll_view`,
 `gut_vt_view_offset`, `gut_vt_set_reply`, `gut_vt_set_title_cb`,
 `gut_vt_set_bell_cb`, `gut_vt_set_clipboard_cb`.

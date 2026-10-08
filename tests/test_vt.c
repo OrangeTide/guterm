@@ -904,6 +904,156 @@ test_osc52(void)
     gut_buf_free(&b);
 }
 
+/* Decode a complete sixel body with the given DCS P2 and limit. */
+static int
+sixel(struct gut_image *img, int p2, size_t limit, const char *body)
+{
+    struct gut_sixel s;
+
+    memset(&s, 0, sizeof(s));
+    gut_sixel_begin(&s, 0, p2, 0, limit);
+    for (; *body; body++)
+        gut_sixel_put(&s, (unsigned char)*body);
+    return gut_sixel_end(&s, img);
+}
+
+static uint32_t
+pixel(const struct gut_image *img, int x, int y)
+{
+    const uint8_t *p = img->rgba + ((size_t)y * img->w + x) * 4;
+
+    return ((uint32_t)p[3] << 24) | ((uint32_t)p[0] << 16) |
+           ((uint32_t)p[1] << 8) | p[2];
+}
+
+static void
+test_sixel(void)
+{
+    struct gut_image img;
+    struct gut_sixel s;
+    struct gut_buf b;
+    struct gut_vt vt;
+
+    /* one full column in default color 1, VT340 blue */
+    CHECK(sixel(&img, 1, 0, "#1~") == 1);
+    CHECK(img.w == 1 && img.h == 6);
+    CHECK(pixel(&img, 0, 0) == 0xFF3333CC);
+    CHECK(pixel(&img, 0, 5) == 0xFF3333CC);
+    gut_image_free(&img);
+
+    /* RGB color definition and repeat */
+    CHECK(sixel(&img, 1, 0, "#2;2;100;0;0!3@") == 1);
+    CHECK(img.w == 3 && img.h == 1);
+    CHECK(pixel(&img, 2, 0) == 0xFFFF0000);
+    gut_image_free(&img);
+
+    /* HLS: sixel hue 120 is red, 0 is blue, 240 is green */
+    CHECK(sixel(&img, 1, 0, "#5;1;120;50;100@") == 1);
+    CHECK(pixel(&img, 0, 0) == 0xFFFF0000);
+    gut_image_free(&img);
+    CHECK(sixel(&img, 1, 0, "#5;1;0;50;100@") == 1);
+    CHECK(pixel(&img, 0, 0) == 0xFF0000FF);
+    gut_image_free(&img);
+    CHECK(sixel(&img, 1, 0, "#5;1;240;50;100@") == 1);
+    CHECK(pixel(&img, 0, 0) == 0xFF00FF00);
+    gut_image_free(&img);
+    CHECK(sixel(&img, 1, 0, "#5;1;0;50;0@") == 1);
+    CHECK(pixel(&img, 0, 0) == 0xFF808080);
+    gut_image_free(&img);
+
+    /* transparent background: only painted bits have alpha */
+    CHECK(sixel(&img, 1, 0, "#1A") == 1);
+    CHECK(img.w == 1 && img.h == 2);
+    CHECK(pixel(&img, 0, 0) == 0 && pixel(&img, 0, 1) == 0xFF3333CC);
+    gut_image_free(&img);
+
+    /* opaque background: unpainted pixels take color 0 */
+    CHECK(sixel(&img, 0, 0, "#0;2;0;0;100#1A") == 1);
+    CHECK(pixel(&img, 0, 0) == 0xFF0000FF && pixel(&img, 0, 1) == 0xFF3333CC);
+    gut_image_free(&img);
+
+    /* raster attributes are a floor on the size; the aspect stretches */
+    CHECK(sixel(&img, 0, 0, "\"1;1;4;4#1@") == 1);
+    CHECK(img.w == 4 && img.h == 4);
+    CHECK(pixel(&img, 0, 0) == 0xFF3333CC && pixel(&img, 3, 3) == 0xFF000000);
+    gut_image_free(&img);
+    CHECK(sixel(&img, 1, 0, "\"2;1;1;1#1@") == 1);
+    CHECK(img.w == 1 && img.h == 2);
+    CHECK(pixel(&img, 0, 1) == 0xFF3333CC);
+    gut_image_free(&img);
+
+    /* $ returns to the left, - starts the next band of six */
+    CHECK(sixel(&img, 1, 0, "#1@@$#2@-#1@") == 1);
+    CHECK(img.w == 2 && img.h == 7);
+    CHECK(pixel(&img, 0, 0) == 0xFFCC2121 && pixel(&img, 1, 0) == 0xFF3333CC);
+    CHECK(pixel(&img, 0, 6) == 0xFF3333CC && pixel(&img, 1, 6) == 0);
+    gut_image_free(&img);
+
+    /* a blank repeat advances the pen and widens the picture */
+    CHECK(sixel(&img, 1, 0, "!5?#1@") == 1);
+    CHECK(img.w == 6 && img.h == 1);
+    CHECK(pixel(&img, 0, 0) == 0 && pixel(&img, 5, 0) == 0xFF3333CC);
+    gut_image_free(&img);
+
+    /* nothing painted, bytes that are not sixel, color index wrap */
+    CHECK(sixel(&img, 1, 0, "") == 0);
+    CHECK(sixel(&img, 1, 0, "!5?$-") == 0);
+    CHECK(sixel(&img, 1, 0, "#1\r\n@\x01") == 1);
+    CHECK(img.w == 1 && img.h == 1);
+    gut_image_free(&img);
+    CHECK(sixel(&img, 1, 0, "#257;2;100;100;100#1@") == 1);
+    CHECK(pixel(&img, 0, 0) == 0xFFFFFFFF);
+    gut_image_free(&img);
+
+    /* over the limit: dropped, then the decoder is reusable */
+    CHECK(sixel(&img, 1, 16, "!100@") == 0);
+    CHECK(img.rgba == NULL);
+    CHECK(sixel(&img, 1, 16, "\"1;1;100;100") == 0);
+    CHECK(sixel(&img, 1, 16, "#1@") == 1);
+    CHECK(img.w == 1 && img.h == 1);
+    gut_image_free(&img);
+    memset(&s, 0, sizeof(s));
+    gut_sixel_begin(&s, 0, 1, 0, 16);
+    gut_sixel_put(&s, '!');
+    gut_sixel_put(&s, '9');
+    gut_sixel_put(&s, '9');
+    gut_sixel_put(&s, '@');
+    CHECK(s.failed && s.rgba == NULL);
+    gut_sixel_put(&s, '@');
+    CHECK(gut_sixel_end(&s, &img) == 0);
+    gut_sixel_abort(&s);
+
+    /* through the VT: the DCS is consumed and text goes on after it */
+    gut_buf_init(&b, 3, 10);
+    gut_vt_init(&vt, &b);
+    feed(&vt, "A\033P0;1;0q#1~~~\033\\B");
+    CHECK(strcmp(row_text(&b, 0), "AB") == 0);
+    feed(&vt, "\033P");
+    feed(&vt, "q#1");
+    feed(&vt, "~\033");
+    feed(&vt, "\\C");
+    CHECK(strcmp(row_text(&b, 0), "ABC") == 0);
+    /* ESC other than ST ends the picture and is interpreted */
+    feed(&vt, "\033Pq#1~\033[2;1HD");
+    CHECK(strcmp(row_text(&b, 1), "D") == 0);
+    /* a DCS that is not sixel is still swallowed */
+    feed(&vt, "\033P1$r0q\033\\E\033P+q544e\033\\F");
+    CHECK(strcmp(row_text(&b, 1), "DEF") == 0);
+    /* controls inside the picture do not execute */
+    feed(&vt, "\033Pq#1\r\n~\033\\G");
+    CHECK(strcmp(row_text(&b, 1), "DEFG") == 0);
+    /* a reset mid picture leaves the parser in ground */
+    feed(&vt, "\033Pq#1~");
+    gut_vt_reset(&vt);
+    feed(&vt, "H");
+    CHECK(strcmp(row_text(&b, 0), "H") == 0);
+    gut_vt_set_image_limit(&vt, 4);
+    feed(&vt, "\033Pq!100~\033\\I");
+    CHECK(strcmp(row_text(&b, 0), "HI") == 0);
+    gut_vt_free(&vt);
+    gut_buf_free(&b);
+}
+
 int
 main(void)
 {
@@ -918,6 +1068,7 @@ main(void)
     test_vt_mouse();
     test_selection();
     test_osc52();
+    test_sixel();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

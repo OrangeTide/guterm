@@ -259,6 +259,50 @@ gen_utf8(unsigned char *out, size_t cap)
     return (size_t)gut_utf8_encode(out, cp);
 }
 
+/* A sixel DCS, mostly well formed, sometimes cut short. */
+static size_t
+gen_sixel(unsigned char *out, size_t cap)
+{
+    static const char sixel_cmds[] = "\"#!$-";
+    size_t n = 0;
+    int len = rnd_range(0, 200);
+
+    if (cap < 300)
+        return 0;
+    out[n++] = 0x1B;
+    out[n++] = 'P';
+    if (rnd_range(0, 1)) {
+        out[n++] = (unsigned char)('0' + rnd_range(0, 9));
+        out[n++] = ';';
+        out[n++] = (unsigned char)('0' + rnd_range(0, 2));
+    }
+    out[n++] = 'q';
+    for (int i = 0; i < len; i++) {
+        switch (rnd_range(0, 9)) {
+        case 0: case 1:
+            out[n++] = (unsigned char)sixel_cmds[rnd_range(0, 4)];
+            break;
+        case 2: case 3:
+            out[n++] = (unsigned char)('0' + rnd_range(0, 9));
+            break;
+        case 4:
+            out[n++] = ';';
+            break;
+        case 5:
+            out[n++] = (unsigned char)rnd();
+            break;
+        default:
+            out[n++] = (unsigned char)rnd_range(0x3F, 0x7E);
+            break;
+        }
+    }
+    if (rnd_range(0, 3)) {
+        out[n++] = 0x1B;
+        out[n++] = '\\';
+    }
+    return n;
+}
+
 /* Build one chunk of mixed input into an exactly sized heap buffer. */
 static unsigned char *
 gen_chunk(size_t *len_out)
@@ -269,10 +313,12 @@ gen_chunk(size_t *len_out)
     unsigned char *copy;
 
     while ((int)n < target) {
-        int kind = rnd_range(0, 9);
+        int kind = rnd_range(0, 10);
 
         if (kind < 4) {
             n += gen_escape(tmp + n, sizeof(tmp) - n);
+        } else if (kind == 10) {
+            n += gen_sixel(tmp + n, sizeof(tmp) - n);
         } else if (kind < 7) {
             n += gen_utf8(tmp + n, sizeof(tmp) - n);
         } else if (kind == 7) {
@@ -375,6 +421,9 @@ torture_vt(unsigned long iterations)
                      gut_vt_view_offset(&vt));
             check_vt(&vt);
         }
+        if (rnd_range(0, 49) == 0)
+            gut_vt_set_image_limit(&vt, rnd_range(0, 3) == 0
+                                   ? 0 : (size_t)rnd_range(1, 100000));
         if (rnd_range(0, 99) == 0) {
             if (gut_vt_set_scrollback(&vt, rnd_range(0, 3) == 0
                                       ? 0 : rnd_range(1, 200)) != 0)
