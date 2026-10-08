@@ -44,7 +44,7 @@ extern "C" {
 #define GUT_API extern
 #endif
 
-#define GUT_VERSION "0.1.0"
+#define GUT_VERSION "0.1.1"
 
 /****************************************************************
  * Cells
