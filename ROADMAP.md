@@ -30,21 +30,18 @@ Decisions:
 - Running on a real high density display needs hardware this plan
   cannot reach. It stays a manual item on the release checklist.
 
-Phases (in the vedit checkout for 1 to 3; 1 is done):
+Phases (in the vedit checkout for 1 and 2; 1 is done):
 
 1. `gut_wake` in gvedit. Sync the header, add the watcher thread and
    its control pipe, and make the window wait block in `gut_poll` with
    the editor's timeout. Check: a terminal panel open and idle makes no
    wakeups per frame (count with strace), and output still arrives at
    once. Screenshot under Xvfb as the existing script does.
-2. Pictures in the terminal panels. Give the emulator the font's glyph
-   size and wire the picture budget to a setting. Check: a sixel from
-   img2sixel shows in a panel, scrolls with it and survives a panel
-   switch; a screenshot under Xvfb.
-3. gvedit for Windows. Cross build with mingw and the SDL3 mingw
+
+2. gvedit for Windows. Cross build with mingw and the SDL3 mingw
    package as guterm's CI job does, run `--version` under wine, and add
    both to vedit's CI next to the existing gvedit job.
-4. Release 0.2.0 of guterm. Add `release-check`, set the header and the
+3. Release 0.2.0 of guterm. Add `release-check`, set the header and the
    manual to 0.2.0, bring the README status up to date, tag, and run
    `make guterm-sync` in vedit against the tag. The push is yours.
 
