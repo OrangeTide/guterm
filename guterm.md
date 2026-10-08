@@ -7,7 +7,7 @@ back through one poll call. An optional VT100/xterm emulator can fill the
 grid from a byte stream for programs that already produce terminal
 output.
 
-This manual covers version 0.1.0 of `guterm.h`.
+This manual covers version 0.2.0 of `guterm.h`.
 
 ## Contents
 

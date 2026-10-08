@@ -58,7 +58,7 @@ extern "C" {
 #define GUTERM_NO_SIXEL
 #endif
 
-#define GUT_VERSION "0.1.1"
+#define GUT_VERSION "0.2.0"
 
 /****************************************************************
  * Cells
