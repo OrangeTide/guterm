@@ -203,7 +203,7 @@ GUT_API void gut_buf_dirty_all(struct gut_buf *b);
 /** Pin a picture to the grid with its top left at cell (row, col), each
  * cell showing cell_w by cell_h of its pixels. The buffer takes the
  * pixels whether or not it keeps them: img is empty afterwards. Rows
- * below the grid are cut off. Older pictures are discarded, oldest
+ * above the grid, for a negative row, and below it are cut off. Older pictures are discarded, oldest
  * first, until the budget has room; a picture larger than the whole
  * budget is dropped. Returns the picture's id, or -1 when it was not
  * placed. Scrolling moves placements with their rows and cuts off what
@@ -630,6 +630,7 @@ GUT_API const char *gut_error(void);
 #define GUT_VT_MODE_MOUSE        (1u << 7)
 #define GUT_VT_MODE_MOUSE_SGR    (1u << 8)
 #define GUT_VT_MODE_FOCUS        (1u << 9)
+#define GUT_VT_MODE_SIXEL_DISPLAY (1u << 10) /* DECSDM: pictures at home */
 
 #define GUT_VT_MAX_PARAMS 16
 #define GUT_VT_OSC_MAX    (1 << 20)   /* longest OSC string kept */
@@ -740,6 +741,8 @@ struct gut_vt {
     int utf8_len, utf8_need;
     struct gut_sixel sixel;     /* picture being decoded */
     size_t image_max_pixels;
+    int cell_w, cell_h;         /* pixels per cell, for placing pictures */
+    struct gut_image_list alt_images; /* primary pictures while alt is up */
 
     /* callbacks */
     void (*reply)(void *ctx, const char *data, size_t len);
@@ -789,6 +792,11 @@ GUT_API int gut_vt_set_scrollback(struct gut_vt *vt, int lines);
 /** Largest picture the sixel decoder will build, in pixels; a larger
  * one is dropped. 0 restores GUT_VT_IMAGE_MAX_PIXELS. */
 GUT_API void gut_vt_set_image_limit(struct gut_vt *vt, size_t max_pixels);
+
+/** Pixels per cell, used to turn a picture's size into cells. Give
+ * the font's glyph size, 8 by 16 by default; a window that zooms the
+ * font scales pictures the same way. */
+GUT_API void gut_vt_set_cell_size(struct gut_vt *vt, int w, int h);
 
 /** Lines currently held in the scrollback. */
 GUT_API int gut_vt_scrollback_lines(const struct gut_vt *vt);
@@ -1075,14 +1083,39 @@ gut_image_free(struct gut_image *img)
     img->h = 0;
 }
 
+/* Placements in the list that show ref. */
+static int
+gut_images_holding(const struct gut_image_list *l,
+                   const struct gut_image_ref *ref)
+{
+    int n = 0;
+
+    for (int i = 0; i < l->n; i++)
+        if (l->v[i].ref == ref)
+            n++;
+    return n;
+}
+
+/* Release one placement's hold on ref. The list counts a picture's
+ * pixels once however many bands show it, so the count drops when the
+ * last band in this list goes. */
 static void
 gut_image_ref_drop(struct gut_image_list *l, struct gut_image_ref *ref)
 {
+    if (gut_images_holding(l, ref) == 1)
+        l->pixels -= (size_t)ref->img.w * (size_t)ref->img.h;
     if (--ref->refs > 0)
         return;
-    l->pixels -= (size_t)ref->img.w * (size_t)ref->img.h;
     gut_image_free(&ref->img);
     free(ref);
+}
+
+static void
+gut_images_crop_top(struct gut_placement *p, int k)
+{
+    p->row += k;
+    p->rows -= k;
+    p->src_y += k * p->cell_h;
 }
 
 static void
@@ -1193,12 +1226,8 @@ gut_buf_cut_images(struct gut_buf *b, int from, int to)
         if (from <= p->row && to >= end) {
             gut_images_remove(b, i);
         } else if (from <= p->row) {
-            int k = to - p->row;
-
             gut_images_dirty(b, p);
-            p->row += k;
-            p->rows -= k;
-            p->src_y += k * p->cell_h;
+            gut_images_crop_top(p, to - p->row);
         } else {
             gut_images_dirty(b, p);
             p->rows = from - p->row;
@@ -1244,8 +1273,8 @@ gut_buf_place_image(struct gut_buf *b, struct gut_image *img, int row,
     size_t budget = b->image_budget ? b->image_budget : GUT_BUF_IMAGE_BUDGET;
 
     if (img->w <= 0 || img->h <= 0 || !img->rgba || cell_w <= 0 ||
-        cell_h <= 0 || row < 0 || row >= b->rows || col < 0 ||
-        col >= b->cols || pixels > budget)
+        cell_h <= 0 || row >= b->rows || col < 0 || col >= b->cols ||
+        pixels > budget || (row < 0 && -row >= (img->h + cell_h - 1) / cell_h))
         goto drop;
     gut_images_evict(b, budget - pixels);
     ref = malloc(sizeof(*ref));
@@ -1274,8 +1303,10 @@ gut_buf_place_image(struct gut_buf *b, struct gut_image *img, int row,
     p->cell_h = cell_h;
     p->src_y = 0;
     p->seq = b->image_seq++;
-    if (row + p->rows > b->rows)
-        p->rows = b->rows - row;
+    if (row < 0)
+        gut_images_crop_top(p, -row);
+    if (p->row + p->rows > b->rows)
+        p->rows = b->rows - p->row;
     gut_images_dirty(b, p);
     return ref->id;
 drop:
@@ -1300,8 +1331,10 @@ gut_buf_images(const struct gut_buf *b, int *n)
 void
 gut_image_list_free(struct gut_image_list *list)
 {
-    for (int i = 0; i < list->n; i++)
-        gut_image_ref_drop(list, list->v[i].ref);
+    while (list->n > 0) {
+        gut_image_ref_drop(list, list->v[list->n - 1].ref);
+        list->n--;
+    }
     free(list->v);
     list->v = NULL;
     list->n = 0;
@@ -1339,6 +1372,37 @@ gut_buf_swap_images(struct gut_buf *b, struct gut_image_list *other)
                                       : GUT_BUF_IMAGE_BUDGET);
     for (int i = 0; i < b->images.n; i++)
         gut_images_dirty(b, &b->images.v[i]);
+}
+
+/* Replace dst's placements with src's moved down by offset rows and
+ * clipped to dst's grid, sharing the pictures. For a scrolled back
+ * view; the budget is not applied. */
+static void
+gut_buf_project_images(struct gut_buf *dst, const struct gut_buf *src,
+                       int offset)
+{
+    const struct gut_image_list *l = &src->images;
+
+    gut_buf_drop_images(dst);
+    for (int i = 0; i < l->n; i++) {
+        struct gut_placement *q;
+        int row = l->v[i].row + offset;
+
+        if (row >= dst->rows)
+            continue;
+        q = gut_images_append(dst);
+        if (!q)
+            return;
+        *q = l->v[i];
+        q->row = row;
+        q->ref->refs++;
+        if (gut_images_holding(&dst->images, q->ref) == 1)
+            dst->images.pixels += (size_t)q->ref->img.w *
+                                  (size_t)q->ref->img.h;
+        if (q->row + q->rows > dst->rows)
+            q->rows = dst->rows - q->row;
+        gut_images_dirty(dst, q);
+    }
 }
 
 int
@@ -4737,6 +4801,7 @@ gut_vt_compose(struct gut_vt *vt)
             out->dirty[r] = 1;
         }
     }
+    gut_buf_project_images(out, live, vt->view);
     out->cursor_visible = 0;
     out->cursor_row = 0;
     out->cursor_col = 0;
@@ -4759,11 +4824,13 @@ gut_vt_view_apply(struct gut_vt *vt, int offset)
         /* park the live screen so the emulator keeps writing to it */
         if (gut_buf_init(&vt->live, out->rows, out->cols) != 0)
             return 0;
+        vt->live.image_budget = out->image_budget;
         memcpy(vt->live.cells, out->cells, bytes);
         vt->live.cursor_row = out->cursor_row;
         vt->live.cursor_col = out->cursor_col;
         vt->live.cursor_visible = out->cursor_visible;
         vt->live.cursor_shape = out->cursor_shape;
+        gut_buf_swap_images(&vt->live, &out->images);
         vt->buf = &vt->live;
     }
     vt->view = offset;
@@ -4773,6 +4840,7 @@ gut_vt_view_apply(struct gut_vt *vt, int offset)
         out->cursor_col = vt->live.cursor_col;
         out->cursor_visible = vt->live.cursor_visible;
         out->cursor_shape = vt->live.cursor_shape;
+        gut_buf_swap_images(out, &vt->live.images);
         gut_buf_dirty_all(out);
         gut_buf_free(&vt->live);
         vt->buf = out;
@@ -4861,6 +4929,8 @@ gut_vt_altscreen_enter(struct gut_vt *vt)
     vt->alt_cursor.fg = vt->fg;
     vt->alt_cursor.bg = vt->bg;
     vt->modes |= GUT_VT_MODE_ALTSCREEN;
+    gut_image_list_free(&vt->alt_images);
+    gut_buf_swap_images(b, &vt->alt_images);
     gut_buf_clear(b, gut_color_default());
 }
 
@@ -4877,6 +4947,8 @@ gut_vt_altscreen_leave(struct gut_vt *vt)
                (size_t)b->rows * (size_t)b->cols * sizeof(*b->cells));
     else
         gut_buf_clear(b, gut_color_default());
+    gut_buf_swap_images(b, &vt->alt_images);
+    gut_image_list_free(&vt->alt_images);
     gut_buf_dirty_all(b);
     free(vt->alt_saved);
     vt->alt_saved = NULL;
@@ -5149,6 +5221,7 @@ gut_vt_decset(struct gut_vt *vt, int n, int on)
         vt->wrap_pending = 0;
         break;
     case 7: bit = GUT_VT_MODE_AUTOWRAP; break;
+    case 80: bit = GUT_VT_MODE_SIXEL_DISPLAY; break;
     case 25:
         vt->buf->cursor_visible = on;
         return;
@@ -5185,6 +5258,30 @@ gut_vt_decset(struct gut_vt *vt, int n, int on)
         vt->modes &= ~bit;
 }
 
+/* XTSMGRAPHICS, CSI ? Pi ; Pa ; Pv S: a program asking what pictures
+ * it may draw. Item 1 is color registers and 2 the pixel area; the
+ * actions read, reset, set and read the maximum all answer with the
+ * fixed values, since neither can change. */
+static void
+gut_vt_graphics_query(struct gut_vt *vt)
+{
+    int item = gut_vt_param(vt, 0, 0);
+    int action = gut_vt_param(vt, 1, 0);
+    char rep[48];
+    int n;
+
+    if (action < 1 || action > 4 || (item != 1 && item != 2)) {
+        n = snprintf(rep, sizeof(rep), "\033[?%d;%dS", item,
+                     item == 1 || item == 2 ? 2 : 1);
+    } else if (item == 1) {
+        n = snprintf(rep, sizeof(rep), "\033[?1;0;%dS", GUT_SIXEL_COLORS);
+    } else {
+        n = snprintf(rep, sizeof(rep), "\033[?2;0;%d;%dS",
+                     vt->buf->cols * vt->cell_w, vt->buf->rows * vt->cell_h);
+    }
+    gut_vt_reply_str(vt, rep, (size_t)n);
+}
+
 static void
 gut_vt_csi(struct gut_vt *vt, int final)
 {
@@ -5197,6 +5294,8 @@ gut_vt_csi(struct gut_vt *vt, int final)
         if (final == 'h' || final == 'l')
             for (int i = 0; i < vt->nparam; i++)
                 gut_vt_decset(vt, vt->params[i], final == 'h');
+        else if (final == 'S')
+            gut_vt_graphics_query(vt);
         return;
     }
     if (vt->intermed == ' ' && final == 'q') {
@@ -5291,7 +5390,7 @@ gut_vt_csi(struct gut_vt *vt, int final)
         break;
     case 'c':
         if (gut_vt_param(vt, 0, 0) == 0)
-            gut_vt_reply_str(vt, "\033[?1;2c", 7);
+            gut_vt_reply_str(vt, "\033[?1;2;4c", 9);
         break;
     case 'n':
         n = gut_vt_param(vt, 0, 0);
@@ -5576,14 +5675,60 @@ gut_vt_osc_put(struct gut_vt *vt, char c)
 
 /* ---- parser ---- */
 
-/* The DCS ended: a finished picture is dropped until placement exists. */
+/* Pin a finished picture to the screen. With sixel scrolling, the
+ * default, it starts at the cursor, the region scrolls to make room
+ * for it and for a cursor line below it, a picture taller than that
+ * loses its top, and the cursor ends on the row after it in the column
+ * it started from. With DECSDM the picture sits at the home position
+ * and the cursor stays put. */
+static void
+gut_vt_place_image(struct gut_vt *vt, struct gut_image *img)
+{
+    struct gut_buf *b = vt->buf;
+    int rows = (img->h + vt->cell_h - 1) / vt->cell_h;
+    int row = vt->row, col = vt->col, last, cut = 0;
+
+    if (vt->modes & GUT_VT_MODE_SIXEL_DISPLAY) {
+        gut_buf_place_image(b, img, 0, 0, vt->cell_w, vt->cell_h);
+        return;
+    }
+    last = row + rows - 1;
+    if (row >= vt->scroll_top && row < vt->scroll_bot) {
+        if (last >= vt->scroll_bot - 1) {
+            int n = last - (vt->scroll_bot - 2);
+
+            gut_vt_scroll_up(vt, n);
+            row -= n;
+            last -= n;
+        }
+        if (row < vt->scroll_top)
+            cut = vt->scroll_top - row;
+    }
+    if (gut_buf_place_image(b, img, row, col, vt->cell_w, vt->cell_h) > 0 &&
+        cut > 0) {
+        /* the region's top bounds the picture, not only the grid's; the
+         * placement just made is the last one, and when row was
+         * negative the grid already took the rows above it */
+        struct gut_placement *p = &b->images.v[b->images.n - 1];
+        int k = row < 0 ? vt->scroll_top : cut;
+
+        if (p->rows > k)
+            gut_images_crop_top(p, k);
+        else
+            gut_images_remove(b, b->images.n - 1);
+    }
+    vt->row = last + 1 < b->rows ? last + 1 : b->rows - 1;
+    vt->col = col;
+    vt->wrap_pending = 0;
+}
+
 static void
 gut_vt_sixel_finish(struct gut_vt *vt)
 {
     struct gut_image img;
 
     if (gut_sixel_end(&vt->sixel, &img))
-        gut_image_free(&img);
+        gut_vt_place_image(vt, &img);
 }
 
 static void
@@ -5845,6 +5990,7 @@ gut_vt_reset(struct gut_vt *vt)
     memset(&vt->saved, 0, sizeof(vt->saved));
     gut_vt_tab_reset(vt);
     gut_sixel_abort(&vt->sixel);
+    gut_image_list_free(&vt->alt_images);
     vt->state = GUT_ST_GROUND;
     vt->utf8_need = 0;
     vt->utf8_len = 0;
@@ -5863,6 +6009,8 @@ gut_vt_init(struct gut_vt *vt, struct gut_buf *buf)
     vt->buf = buf;
     vt->out = buf;
     vt->image_max_pixels = GUT_VT_IMAGE_MAX_PIXELS;
+    vt->cell_w = 8;
+    vt->cell_h = 16;
     vt->tabstops = calloc((size_t)buf->cols, 1);
     if (!vt->tabstops)
         return -1;
@@ -5879,6 +6027,7 @@ void
 gut_vt_free(struct gut_vt *vt)
 {
     gut_sixel_abort(&vt->sixel);
+    gut_image_list_free(&vt->alt_images);
     gut_vt_sb_free_lines(vt);
     free(vt->sb);
     if (vt->view > 0)
@@ -5959,6 +6108,7 @@ gut_vt_resize(struct gut_vt *vt, int rows, int cols)
         free(tabs);
         return -1;
     }
+    gut_image_list_free(&vt->alt_images);   /* a resize drops pictures */
     for (int c = 0; c < cols; c++)
         tabs[c] = c < old_cols ? vt->tabstops[c] : (c % 8) == 0;
     free(vt->tabstops);
@@ -6011,6 +6161,13 @@ void
 gut_vt_set_image_limit(struct gut_vt *vt, size_t max_pixels)
 {
     vt->image_max_pixels = max_pixels ? max_pixels : GUT_VT_IMAGE_MAX_PIXELS;
+}
+
+void
+gut_vt_set_cell_size(struct gut_vt *vt, int w, int h)
+{
+    vt->cell_w = w > 0 ? w : 8;
+    vt->cell_h = h > 0 ? h : 16;
 }
 
 int

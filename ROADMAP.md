@@ -82,7 +82,7 @@ Decisions:
   in the first version, since they need pixels per stored line and a
   composing view.
 
-Phases (1 and 2 are done):
+Phases (1 to 3 are done):
 
 1. Decoder in the VT layer, streaming: DCS parameter parsing, the sixel
    state machine, palette, repeat, raster attributes, transparent

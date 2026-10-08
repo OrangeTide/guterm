@@ -1032,18 +1032,15 @@ with the primary screen parked and restored.
 
 Tabs: HTS, TBC for one stop and for all.
 
-Reports: DA1 answers as a VT100 with advanced video, DSR 5 and 6 answer
-status and cursor position. RIS performs a full reset.
+Reports: DA1 answers as a VT100 with advanced video and sixel graphics, DSR 5 and 6 answer
+status and cursor position. XTSMGRAPHICS
+answers the color register count and the pixel area a picture may
+cover. RIS performs a full reset.
 
 OSC 0 and 2 set the title and OSC 52 reaches the clipboard, both
-through callbacks. A sixel picture (DCS q) is decoded as it streams by
-`gut_sixel_begin`, `gut_sixel_put` and `gut_sixel_end`, which a program
-may also use on their own; the emulator does not yet place the result,
-so the picture is dropped. `gut_vt_set_image_limit` bounds a picture in
-pixels, `GUT_VT_IMAGE_MAX_PIXELS` by default, and a larger one is
-dropped and the rest of its data ignored. Other OSC, other DCS, APC, PM
-and SOS strings, and unknown CSI and ESC sequences are consumed and
-ignored, so a program
+through callbacks. Sixel pictures are placed on the screen, see below.
+Other OSC, other DCS, APC, PM and SOS strings, and unknown CSI and ESC
+sequences are consumed and ignored, so a program
 that emits sequences the emulator does not know still displays sanely.
 An OSC string is kept up to `GUT_VT_OSC_MAX`, one mebibyte; a longer
 one is dropped whole.
@@ -1051,6 +1048,36 @@ one is dropped whole.
 Not implemented: kitty keyboard protocol, XTWINOPS, character set
 designations other than ASCII and line drawing, and combining
 characters, which are dropped.
+
+### Pictures
+
+A sixel picture, DCS q, is decoded as it streams by `gut_sixel_begin`,
+`gut_sixel_put` and `gut_sixel_end`, which a program may also use on
+their own, and placed on the screen with `gut_buf_place_image` as
+section 4 describes. `gut_vt_set_image_limit` bounds a picture in
+pixels, `GUT_VT_IMAGE_MAX_PIXELS` by default; a larger one is dropped
+and the rest of its data ignored. The buffer's own budget bounds what
+all the pictures hold together.
+
+`gut_vt_set_cell_size` tells the emulator how many pixels a cell is,
+8 by 16 by default, so it can turn a picture's size into rows and
+columns. Give it the font's glyph size rather than the zoomed cell:
+a window that draws the font at a zoom draws the pictures at the same
+zoom, so a picture keeps its place under the text.
+
+With sixel scrolling, the default, a picture starts at the cursor. The
+scroll region scrolls up to make room for it and for a line below it,
+where the cursor ends, in the column the picture started from. A
+picture taller than the region loses its top, as it would on a
+terminal that drew it band by band. With DECSDM, DECSET 80, the
+picture sits at the home position and the cursor stays put.
+
+Pictures follow the text: they scroll with it, are cut by erases, go
+with the alternate screen and come back with the primary one, and show
+in a scrolled back view at their place below the scrollback lines.
+Lines that scroll off the top take their part of a picture with them;
+the scrollback keeps text only. A resize drops every picture, the
+alternate screen's parked ones included.
 
 ### Callbacks
 
@@ -1295,6 +1322,7 @@ Super is the Windows key or Command key.
 | `GUT_VT_MODE_MOUSE` | DECSET 1000, 1002, 1003; the specific mode is in `vt->mouse_mode` |
 | `GUT_VT_MODE_MOUSE_SGR` | DECSET 1006 |
 | `GUT_VT_MODE_FOCUS` | DECSET 1004 |
+| `GUT_VT_MODE_SIXEL_DISPLAY` | DECSET 80, DECSDM |
 
 ### Functions by layer
 
@@ -1323,6 +1351,7 @@ VT, no dependencies: `gut_vt_init`, `gut_vt_free`, `gut_vt_reset`,
 `gut_vt_feed`, `gut_vt_resize`, `gut_vt_modes`, `gut_vt_encode_flags`,
 `gut_vt_mouse`,
 `gut_vt_set_scrollback`, `gut_vt_scrollback_lines`, `gut_vt_set_image_limit`,
+`gut_vt_set_cell_size`,
 `gut_sixel_begin`, `gut_sixel_put`, `gut_sixel_end`, `gut_sixel_abort`,
 `gut_vt_clear_scrollback`, `gut_vt_set_view`, `gut_vt_scroll_view`,
 `gut_vt_view_offset`, `gut_vt_set_reply`, `gut_vt_set_title_cb`,

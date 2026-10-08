@@ -572,7 +572,7 @@ test_vt(void)
     feed(&vt, "\033[2;3H\033[6n");
     CHECK(strcmp(last_reply, "\033[2;3R") == 0);
     feed(&vt, "\033[c");
-    CHECK(strcmp(last_reply, "\033[?1;2c") == 0);
+    CHECK(strcmp(last_reply, "\033[?1;2;4c") == 0);
 
     /* UTF-8 and wide characters */
     feed(&vt, "\033[2J\033[H\xe6\xbc\xa2x");
@@ -1216,33 +1216,151 @@ test_sixel(void)
     CHECK(gut_sixel_end(&s, &img) == 0);
     gut_sixel_abort(&s);
 
-    /* through the VT: the DCS is consumed and text goes on after it */
+    /* through the VT: the DCS is consumed, the picture is placed and
+     * the cursor moves below it; a DCS that is not sixel is swallowed,
+     * and controls inside a picture do not execute */
     gut_buf_init(&b, 3, 10);
     gut_vt_init(&vt, &b);
+    gut_vt_set_cell_size(&vt, 8, 6);
     feed(&vt, "A\033P0;1;0q#1~~~\033\\B");
-    CHECK(strcmp(row_text(&b, 0), "AB") == 0);
-    feed(&vt, "\033P");
-    feed(&vt, "q#1");
-    feed(&vt, "~\033");
-    feed(&vt, "\\C");
-    CHECK(strcmp(row_text(&b, 0), "ABC") == 0);
-    /* ESC other than ST ends the picture and is interpreted */
-    feed(&vt, "\033Pq#1~\033[2;1HD");
-    CHECK(strcmp(row_text(&b, 1), "D") == 0);
-    /* a DCS that is not sixel is still swallowed */
+    CHECK(strcmp(row_text(&b, 0), "A") == 0);
+    CHECK(strcmp(row_text(&b, 1), " B") == 0);
+    CHECK(placements(&b) == 1 && placement_at(&b, 0) != NULL);
     feed(&vt, "\033P1$r0q\033\\E\033P+q544e\033\\F");
-    CHECK(strcmp(row_text(&b, 1), "DEF") == 0);
-    /* controls inside the picture do not execute */
-    feed(&vt, "\033Pq#1\r\n~\033\\G");
-    CHECK(strcmp(row_text(&b, 1), "DEFG") == 0);
-    /* a reset mid picture leaves the parser in ground */
+    CHECK(strcmp(row_text(&b, 1), " BEF") == 0);
+    feed(&vt, "\033[1;1H\033P");
+    feed(&vt, "q#1");
+    feed(&vt, "\r\n~\033");
+    feed(&vt, "\\C");
+    CHECK(strcmp(row_text(&b, 1), "CBEF") == 0 && placements(&b) == 2);
+    /* ESC other than ST ends the picture and is interpreted */
+    feed(&vt, "\033[1;1H\033Pq#1~\033[3;1HD");
+    CHECK(strcmp(row_text(&b, 2), "D") == 0 && placements(&b) == 3);
+    /* a reset mid picture leaves the parser in ground and no pictures */
     feed(&vt, "\033Pq#1~");
     gut_vt_reset(&vt);
     feed(&vt, "H");
-    CHECK(strcmp(row_text(&b, 0), "H") == 0);
+    CHECK(strcmp(row_text(&b, 0), "H") == 0 && placements(&b) == 0);
     gut_vt_set_image_limit(&vt, 4);
     feed(&vt, "\033Pq!100~\033\\I");
-    CHECK(strcmp(row_text(&b, 0), "HI") == 0);
+    CHECK(strcmp(row_text(&b, 0), "HI") == 0 && placements(&b) == 0);
+    gut_vt_free(&vt);
+    gut_buf_free(&b);
+}
+
+/* A picture of n bands, 8 pixels wide; with a 6 pixel cell each band
+ * is one row. */
+static void
+feed_bands(struct gut_vt *vt, int n)
+{
+    feed(vt, "\033Pq");
+    for (int i = 0; i < n; i++)
+        feed(vt, i ? "-!8~" : "!8~");
+    feed(vt, "\033\\");
+}
+
+static void
+test_vt_images(void)
+{
+    struct gut_buf b;
+    struct gut_vt vt;
+    const struct gut_placement *p;
+
+    gut_buf_init(&b, 5, 10);
+    gut_vt_init(&vt, &b);
+    gut_vt_set_reply(&vt, reply_cb, NULL);
+    gut_vt_set_cell_size(&vt, 8, 6);
+
+    /* placed at the cursor, cursor to the row below in the same column */
+    feed(&vt, "\033[2;3H");
+    feed_bands(&vt, 2);
+    p = placement_at(&b, 1);
+    CHECK(p && p->col == 2 && p->rows == 2 && p->cols == 1);
+    CHECK(b.cursor_row == 3 && b.cursor_col == 2);
+
+    /* the screen scrolls to fit the picture and a line for the cursor */
+    gut_vt_clear_scrollback(&vt);
+    feed(&vt, "\033[2J\033[1;1Ha\033[5;1H");
+    feed_bands(&vt, 2);
+    p = placement_at(&b, 2);
+    CHECK(p && p->rows == 2 && p->src_y == 0 && placements(&b) == 1);
+    CHECK(b.cursor_row == 4 && gut_vt_scrollback_lines(&vt) == 2);
+    CHECK(strcmp(row_text(&b, 0), "") == 0);
+
+    /* taller than the screen: the top is lost, the bottom shows */
+    feed(&vt, "\033[2J\033[1;1H");
+    feed_bands(&vt, 7);
+    p = placement_at(&b, 0);
+    CHECK(p && p->rows == 4 && p->src_y == 18 && placements(&b) == 1);
+    CHECK(b.cursor_row == 4 && b.cursor_col == 0);
+
+    /* inside a scroll region the region scrolls and the picture stays
+     * within it */
+    feed(&vt, "\033[2J\033[2;4r\033[4;1H");
+    feed_bands(&vt, 4);
+    p = placement_at(&b, 1);
+    CHECK(p && p->rows == 2 && p->src_y == 12 && placements(&b) == 1);
+    CHECK(b.cursor_row == 3);
+    feed(&vt, "\033[r");
+
+    /* a cursor outside the region places without scrolling */
+    feed(&vt, "\033[2J\033[1;3r\033[5;1H");
+    feed_bands(&vt, 3);
+    p = placement_at(&b, 4);
+    CHECK(p && p->rows == 1 && placements(&b) == 1 && b.cursor_row == 4);
+    feed(&vt, "\033[r");
+
+    /* DECSDM: at the home position, cursor unchanged */
+    feed(&vt, "\033[2J\033[?80h\033[3;4H");
+    feed_bands(&vt, 2);
+    p = placement_at(&b, 0);
+    CHECK(p && p->col == 0 && b.cursor_row == 2 && b.cursor_col == 3);
+    feed(&vt, "\033[?80l");
+
+    /* the alternate screen has its own pictures; the primary's return */
+    feed(&vt, "\033[2J\033[1;1H");
+    feed_bands(&vt, 1);
+    feed(&vt, "\033[?1049h");
+    CHECK(placements(&b) == 0);
+    feed(&vt, "\033[3;1H");
+    feed_bands(&vt, 1);
+    CHECK(placements(&b) == 1 && placement_at(&b, 2) != NULL);
+    feed(&vt, "\033[?1049l");
+    CHECK(placements(&b) == 1 && placement_at(&b, 0) != NULL);
+
+    /* scrolled back, pictures move down with the live screen */
+    feed(&vt, "\033[2J\033[1;1Hx\r\ny\r\n");
+    feed_bands(&vt, 1);
+    CHECK(placement_at(&b, 2) != NULL);
+    CHECK(gut_vt_set_view(&vt, 2) == 2);
+    CHECK(placements(&b) == 1 && placement_at(&b, 4) != NULL);
+    feed(&vt, "\033[1;1H");
+    feed_bands(&vt, 1);
+    CHECK(placements(&b) == 2 && placement_at(&b, 2) != NULL);
+    CHECK(placement_at(&b, 4) != NULL);
+    CHECK(gut_vt_set_view(&vt, 0) == 0);
+    CHECK(placements(&b) == 2 && placement_at(&b, 0) != NULL);
+
+    /* queries */
+    feed(&vt, "\033[?2;1;0S");
+    CHECK(strcmp(last_reply, "\033[?2;0;80;30S") == 0);
+    feed(&vt, "\033[?1;4;0S");
+    CHECK(strcmp(last_reply, "\033[?1;0;256S") == 0);
+    feed(&vt, "\033[?3;1;0S");
+    CHECK(strcmp(last_reply, "\033[?3;1S") == 0);
+    feed(&vt, "\033[?2;9;0S");
+    CHECK(strcmp(last_reply, "\033[?2;2S") == 0);
+    feed(&vt, "\033[4;1Hz\033[1S");
+    CHECK(strcmp(row_text(&b, 2), "z") == 0);
+
+    /* a resize drops the pictures, parked ones too */
+    feed(&vt, "\033[?1049h");
+    feed_bands(&vt, 1);
+    CHECK(gut_vt_resize(&vt, 5, 12) == 0);
+    CHECK(placements(&b) == 0);
+    feed(&vt, "\033[?1049l");
+    CHECK(placements(&b) == 0);
+
     gut_vt_free(&vt);
     gut_buf_free(&b);
 }
@@ -1263,6 +1381,7 @@ main(void)
     test_selection();
     test_osc52();
     test_sixel();
+    test_vt_images();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }
