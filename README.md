@@ -93,6 +93,10 @@ Configuration macros, set before the implementation include:
 - `GUTERM_NO_WINDOW` leaves out SDL and the renderer. The buffer, font
   tables, key encoder and VT layer remain with no dependency beyond libc.
 - `GUTERM_NO_VT` leaves out the VT layer.
+- `GUTERM_NO_IMAGES` leaves out pictures, `GUTERM_NO_SIXEL` only the sixel
+  decoder, `GUTERM_NO_GAMEPAD` the game controllers, and
+  `GUTERM_NO_DEFAULT_FONT` the built-in font table. `make configs`
+  compiles each of them.
 
 ## Examples and tests
 

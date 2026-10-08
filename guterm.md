@@ -53,6 +53,10 @@ Configuration macros, defined before the implementation include:
 | --- | --- |
 | `GUTERM_NO_WINDOW` | Leave out SDL and the renderer. The buffer, font tables, key encoder and VT layer remain, with no dependency beyond libc. |
 | `GUTERM_NO_VT` | Leave out the VT layer. |
+| `GUTERM_NO_IMAGES` | Leave out pictures: the buffer placements, the renderer's textures and the sixel decoder. |
+| `GUTERM_NO_SIXEL` | Leave out the sixel decoder only. A program may still place its own pictures; DA1 then stops advertising sixel. |
+| `GUTERM_NO_GAMEPAD` | Leave out game controller support. The pad event types and enums remain so a program compiles either way. |
+| `GUTERM_NO_DEFAULT_FONT` | Leave out the built-in font table, the largest part of the header. `gut_desc.font` is then required and `gut_open` fails without it. |
 | `GUT_API` | Linkage for the public functions. Default is `extern`. Define it as `static` to keep the symbols private to one file. |
 
 ### A first program

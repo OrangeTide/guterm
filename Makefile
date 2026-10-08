@@ -7,6 +7,7 @@
 # Targets:
 #   all      examples and tests
 #   test     unit tests and a short torture run
+#   configs  compile the header with each feature left out
 #   torture  longer torture run (TORTURE_ITER and TORTURE_SEED)
 #   asan     tests under address sanitizer
 #   ubsan    tests under undefined behavior sanitizer
@@ -36,7 +37,7 @@ ASAN_FLAGS := -O1 -g -fsanitize=address -fno-omit-frame-pointer
 UBSAN_FLAGS := -O1 -g -fsanitize=undefined -fno-sanitize-recover=all
 COV_FLAGS := -O0 -g --coverage
 
-.PHONY: all test torture asan ubsan cov clean
+.PHONY: all test configs torture asan ubsan cov clean
 
 all: $(EXAMPLES) $(TESTS)
 
@@ -62,9 +63,24 @@ $(OUT)/test_vt: tests/test_vt.c guterm.h | $(OUT)
 $(OUT)/torture: tests/torture.c guterm.h | $(OUT)
 	$(CC) $(CFLAGS) -I. -o $@ $<
 
-test: $(TESTS)
+test: $(TESTS) configs
 	$(OUT)/test_vt
 	$(OUT)/torture 20000 $(TORTURE_SEED)
+
+# Every feature macro, alone and all together, must compile cleanly.
+# GUTERM_NO_WINDOW builds need no SDL, the others only its headers.
+CONFIGS := GUTERM_NO_WINDOW GUTERM_NO_VT GUTERM_NO_IMAGES GUTERM_NO_SIXEL \
+    GUTERM_NO_GAMEPAD GUTERM_NO_DEFAULT_FONT
+
+configs: | $(OUT)
+	printf '#define GUTERM_IMPLEMENTATION\n#include "guterm.h"\n' \
+	    > $(OUT)/config.c
+	for m in $(CONFIGS) all; do \
+	    if [ $$m = all ]; then flags="$(CONFIGS:%=-D%)"; else flags=-D$$m; fi; \
+	    echo "configs: $$flags"; \
+	    $(CC) $(CFLAGS) -Werror $$flags $(SDL_CFLAGS) -I. -c \
+	        -o $(OUT)/config.o $(OUT)/config.c || exit 1; \
+	done
 
 torture: $(OUT)/torture
 	$(OUT)/torture $(TORTURE_ITER) $(TORTURE_SEED)

@@ -24,6 +24,14 @@
  *                        buffer, font tables, key encoder and VT layer
  *                        remain, with no dependency beyond libc.
  *     GUTERM_NO_VT       leave out the VT escape sequence layer.
+ *     GUTERM_NO_IMAGES   leave out pictures: the buffer placements, the
+ *                        renderer's textures and the sixel decoder.
+ *     GUTERM_NO_SIXEL    leave out the sixel decoder only; a program may
+ *                        still place its own pictures.
+ *     GUTERM_NO_GAMEPAD  leave out game controller support.
+ *     GUTERM_NO_DEFAULT_FONT
+ *                        leave out the built-in font; gut_desc.font is
+ *                        then required.
  *     GUT_API            linkage for the public functions (default extern).
  *
  * Linking needs SDL3 unless GUTERM_NO_WINDOW is set. OpenGL entry points
@@ -43,6 +51,11 @@ extern "C" {
 
 #ifndef GUT_API
 #define GUT_API extern
+#endif
+
+/* No pictures at all means no sixel decoder either. */
+#if defined(GUTERM_NO_IMAGES) && !defined(GUTERM_NO_SIXEL)
+#define GUTERM_NO_SIXEL
 #endif
 
 #define GUT_VERSION "0.1.1"
@@ -99,6 +112,7 @@ GUT_API void gut_cell_erase(struct gut_cell *c, struct gut_color bg);
  * Cell buffer
  ****************************************************************/
 
+#ifndef GUTERM_NO_IMAGES
 /* ---- images ---- */
 
 /** A picture: w by h pixels of RGBA, row major, 4 bytes each, alpha 0
@@ -139,6 +153,8 @@ struct gut_image_list {
 #define GUT_BUF_IMAGE_BUDGET (1 << 24)      /* pixels, 64 MiB of RGBA */
 #define GUT_BUF_IMAGE_MAX_PLACEMENTS 1024  /* bands on screen at once */
 
+#endif /* GUTERM_NO_IMAGES */
+
 enum gut_cursor_shape {
     GUT_CURSOR_BLOCK,
     GUT_CURSOR_UNDERLINE,
@@ -152,9 +168,11 @@ struct gut_buf {
     int cursor_row, cursor_col;
     int cursor_visible;
     int cursor_shape;           /* enum gut_cursor_shape */
+#ifndef GUTERM_NO_IMAGES
     struct gut_image_list images;
     size_t image_budget;        /* pixels the list may hold */
     unsigned image_seq;
+#endif /* GUTERM_NO_IMAGES */
 };
 
 /** Allocate a rows by cols grid of blank cells. Returns 0 or -1. */
@@ -201,6 +219,7 @@ GUT_API void gut_buf_scroll(struct gut_buf *b, int top, int bot, int count,
 
 GUT_API void gut_buf_dirty_all(struct gut_buf *b);
 
+#ifndef GUTERM_NO_IMAGES
 /** Pin a picture to the grid with its top left at cell (row, col), each
  * cell showing cell_w by cell_h of its pixels. The buffer takes the
  * pixels whether or not it keeps them: img is empty afterwards. Rows
@@ -235,6 +254,8 @@ GUT_API void gut_buf_drop_images(struct gut_buf *b);
 GUT_API void gut_buf_swap_images(struct gut_buf *b,
                                  struct gut_image_list *other);
 GUT_API void gut_image_list_free(struct gut_image_list *list);
+
+#endif /* GUTERM_NO_IMAGES */
 
 enum gut_copy_mode {
     GUT_COPY_STREAM,    /* reading order from start to end, inclusive */
@@ -281,8 +302,10 @@ struct gut_font {
     const uint32_t *cmap;
 };
 
+#ifndef GUTERM_NO_DEFAULT_FONT
 /** The built-in 8x16 face (unscii-16, public domain, 491 glyphs). */
 GUT_API const struct gut_font *gut_font_default(void);
+#endif /* GUTERM_NO_DEFAULT_FONT */
 
 /** Glyph index of cp in font, or -1 when the font has no glyph for it. */
 GUT_API int gut_font_lookup(const struct gut_font *font, uint32_t cp);
@@ -570,6 +593,7 @@ GUT_API void gut_set_compose_overlay(gut_window *w, int on);
  * cell colors swapped. The struct is copied; NULL clears it. */
 GUT_API void gut_set_selection(gut_window *w, const struct gut_sel *sel);
 
+#ifndef GUTERM_NO_GAMEPAD
 /* Game controllers. Up to GUT_MAX_PADS are tracked in slots 0 to 3,
  * assigned in connection order; a slot is reused after its pad leaves.
  * Changes arrive as GUT_EVENT_PAD_* events and the whole state can be
@@ -588,6 +612,8 @@ GUT_API int gut_pad_get(const gut_window *w, int slot, struct gut_pad *out);
  * -1 when the slot is empty or the pad cannot rumble. */
 GUT_API int gut_pad_rumble(gut_window *w, int slot, uint16_t low,
                            uint16_t high, uint32_t ms);
+
+#endif /* GUTERM_NO_GAMEPAD */
 
 /* Key state, for programs that act on what is held rather than on
  * key presses: a game moving while W is down. The state is kept from
@@ -648,6 +674,7 @@ struct gut_vt_saved {
     struct gut_color fg, bg;
 };
 
+#ifndef GUTERM_NO_SIXEL
 #define GUT_SIXEL_COLORS 256
 #define GUT_VT_IMAGE_MAX_PIXELS (1 << 22)   /* 2048 by 2048 */
 #define GUT_SIXEL_MAX_DIM 4096              /* widest or tallest */
@@ -691,6 +718,8 @@ GUT_API void gut_sixel_put(struct gut_sixel *s, unsigned char c);
  * over the limit. The decoder is idle afterwards either way. */
 GUT_API int gut_sixel_end(struct gut_sixel *s, struct gut_image *out);
 GUT_API void gut_sixel_abort(struct gut_sixel *s);
+
+#endif /* GUTERM_NO_SIXEL */
 
 /* One scrollback line: the cells up to the last non-blank one. */
 struct gut_vt_line {
@@ -742,10 +771,14 @@ struct gut_vt {
     int osc_overflow;           /* string too long: dropped at the end */
     unsigned char utf8_buf[4];
     int utf8_len, utf8_need;
+#ifndef GUTERM_NO_SIXEL
     struct gut_sixel sixel;     /* picture being decoded */
     size_t image_max_pixels;
+#endif /* GUTERM_NO_SIXEL */
+#ifndef GUTERM_NO_IMAGES
     int cell_w, cell_h;         /* pixels per cell, for placing pictures */
     struct gut_image_list alt_images; /* primary pictures while alt is up */
+#endif /* GUTERM_NO_IMAGES */
 
     /* callbacks */
     void (*reply)(void *ctx, const char *data, size_t len);
@@ -792,14 +825,18 @@ GUT_API size_t gut_vt_mouse(struct gut_vt *vt, const struct gut_event *ev,
  * lines survive a shrink. Returns 0 or -1. */
 GUT_API int gut_vt_set_scrollback(struct gut_vt *vt, int lines);
 
+#ifndef GUTERM_NO_SIXEL
 /** Largest picture the sixel decoder will build, in pixels; a larger
  * one is dropped. 0 restores GUT_VT_IMAGE_MAX_PIXELS. */
 GUT_API void gut_vt_set_image_limit(struct gut_vt *vt, size_t max_pixels);
+#endif /* GUTERM_NO_SIXEL */
 
+#ifndef GUTERM_NO_IMAGES
 /** Pixels per cell, used to turn a picture's size into cells. Give
  * the font's glyph size, 8 by 16 by default; a window that zooms the
  * font scales pictures the same way. */
 GUT_API void gut_vt_set_cell_size(struct gut_vt *vt, int w, int h);
+#endif /* GUTERM_NO_IMAGES */
 
 /** Lines currently held in the scrollback. */
 GUT_API int gut_vt_scrollback_lines(const struct gut_vt *vt);
@@ -1075,6 +1112,7 @@ gut_rune_width(uint32_t cp)
  * Cell buffer
  ****************************************************************/
 
+#ifndef GUTERM_NO_IMAGES
 /* ---- images ---- */
 
 /* Picture ids are one sequence for the process, so a renderer that
@@ -1436,6 +1474,8 @@ gut_buf_project_images(struct gut_buf *dst, const struct gut_buf *src,
 }
 #endif /* GUTERM_NO_VT */
 
+#endif /* GUTERM_NO_IMAGES */
+
 int
 gut_buf_init(struct gut_buf *b, int rows, int cols)
 {
@@ -1458,7 +1498,9 @@ gut_buf_init(struct gut_buf *b, int rows, int cols)
 void
 gut_buf_free(struct gut_buf *b)
 {
+#ifndef GUTERM_NO_IMAGES
     gut_image_list_free(&b->images);
+#endif /* GUTERM_NO_IMAGES */
     free(b->cells);
     free(b->dirty);
     b->cells = NULL;
@@ -1493,7 +1535,9 @@ gut_buf_resize(struct gut_buf *b, int rows, int cols)
         memcpy(&cells[r * cols], &b->cells[r * b->cols],
                (size_t)keep_cols * sizeof(*cells));
     memset(dirty, 1, (size_t)rows);
+#ifndef GUTERM_NO_IMAGES
     gut_image_list_free(&b->images);
+#endif /* GUTERM_NO_IMAGES */
     free(b->cells);
     free(b->dirty);
     b->cells = cells;
@@ -1531,7 +1575,9 @@ gut_buf_clear_rows(struct gut_buf *b, int from, int to, struct gut_color bg)
         from = 0;
     if (to > b->rows)
         to = b->rows;
+#ifndef GUTERM_NO_IMAGES
     gut_buf_cut_images(b, from, to);
+#endif /* GUTERM_NO_IMAGES */
     for (int r = from; r < to; r++) {
         for (int c = 0; c < b->cols; c++)
             gut_cell_erase(&b->cells[r * b->cols + c], bg);
@@ -1661,7 +1707,9 @@ gut_buf_scroll(struct gut_buf *b, int top, int bot, int count,
         gut_buf_clear_rows(b, top, bot, bg);
         return;
     }
+#ifndef GUTERM_NO_IMAGES
     gut_images_scroll(b, top, bot, count);
+#endif /* GUTERM_NO_IMAGES */
     if (count > 0) {
         memmove(&b->cells[top * b->cols], &b->cells[(top + count) * b->cols],
                 (size_t)(n - count) * (size_t)b->cols * sizeof(*b->cells));
@@ -2048,6 +2096,7 @@ gut_encode_event(const struct gut_event *ev, char *out, size_t n, int flags)
     return len;
 }
 
+#ifndef GUTERM_NO_DEFAULT_FONT
 /****************************************************************
  * Built-in font: unscii-16 subset (Viznut, public domain)
  ****************************************************************/
@@ -2623,6 +2672,8 @@ gut_font_default(void)
     return &f;
 }
 
+#endif /* GUTERM_NO_DEFAULT_FONT */
+
 /****************************************************************
  * Selection
  ****************************************************************/
@@ -3003,6 +3054,7 @@ struct gut_window {
     struct gut_vertex *verts;
     size_t nverts, cap;
 
+#ifndef GUTERM_NO_IMAGES
     /* one texture per picture on screen, kept while it stays there */
     struct gut_texture {
         int id;
@@ -3012,6 +3064,7 @@ struct gut_window {
     } *textures;
     int ntextures, cap_textures;
     int max_texture;            /* GL_MAX_TEXTURE_SIZE */
+#endif /* GUTERM_NO_IMAGES */
 
     char *clip;                 /* last clipboard text handed out */
     char *primary;              /* last primary selection handed out */
@@ -3021,15 +3074,19 @@ struct gut_window {
     int paste_keys;
     int overlay;
     int owns_video;             /* gut_open initialised SDL video */
+#ifndef GUTERM_NO_GAMEPAD
     int owns_gamepad;
+#endif /* GUTERM_NO_GAMEPAD */
     uint64_t t0;
     int focused;
 
     struct gut_sel sel;         /* highlighted selection, if sel.active */
 
+#ifndef GUTERM_NO_GAMEPAD
     SDL_Gamepad *pads[GUT_MAX_PADS];
     SDL_JoystickID pad_ids[GUT_MAX_PADS];
     struct gut_pad pad_state[GUT_MAX_PADS];
+#endif /* GUTERM_NO_GAMEPAD */
 
     int held[64];               /* keys down, by gut_key code */
     int nheld;
@@ -3300,7 +3357,16 @@ gut_open(const struct gut_desc *desc)
         gut_set_error("out of memory", NULL);
         return NULL;
     }
-    w->font = d.font ? d.font : gut_font_default();
+    w->font = d.font;
+#ifndef GUTERM_NO_DEFAULT_FONT
+    if (!w->font)
+        w->font = gut_font_default();
+#endif
+    if (!w->font) {
+        gut_set_error("no font", NULL);
+        free(w);
+        return NULL;
+    }
     cols = d.cols > 0 ? d.cols : 80;
     rows = d.rows > 0 ? d.rows : 25;
     gut_set_palette(w, d.palette);
@@ -3318,9 +3384,11 @@ gut_open(const struct gut_desc *desc)
         }
         w->owns_video = 1;
     }
+#ifndef GUTERM_NO_GAMEPAD
     if (!d.no_gamepad && !SDL_WasInit(SDL_INIT_GAMEPAD) &&
         SDL_InitSubSystem(SDL_INIT_GAMEPAD))
         w->owns_gamepad = 1;    /* failure just means no pads */
+#endif /* GUTERM_NO_GAMEPAD */
     /* Zoom: as asked, else 1 on an ordinary display and the rounded
      * content scale on a high density one, so text is about the same
      * physical size everywhere. */
@@ -3341,7 +3409,9 @@ gut_open(const struct gut_desc *desc)
         return NULL;
     }
     GUT_GL(glGenBuffers)(1, &w->vbo);
+#ifndef GUTERM_NO_IMAGES
     GUT_GL(glGetIntegerv)(GUT_GL_MAX_TEXTURE_SIZE, &w->max_texture);
+#endif /* GUTERM_NO_IMAGES */
     GUT_GL(glDisable)(GUT_GL_DEPTH_TEST);
     GUT_GL(glDisable)(GUT_GL_CULL_FACE);
     GUT_GL(glDisable)(GUT_GL_SCISSOR_TEST);
@@ -3383,8 +3453,10 @@ gut_close(gut_window *w)
             GUT_GL(glDeleteTextures)(1, &w->tex);
         if (w->prog)
             GUT_GL(glDeleteProgram)(w->prog);
+#ifndef GUTERM_NO_IMAGES
         for (int i = 0; i < w->ntextures; i++)
             GUT_GL(glDeleteTextures)(1, &w->textures[i].tex);
+#endif /* GUTERM_NO_IMAGES */
         SDL_GL_DestroyContext(w->ctx);
     }
     if (w->win)
@@ -3396,12 +3468,16 @@ gut_close(gut_window *w)
     free(w->event_text);
     free(w->preedit);
     free(w->verts);
+#ifndef GUTERM_NO_IMAGES
     free(w->textures);
+#endif /* GUTERM_NO_IMAGES */
+#ifndef GUTERM_NO_GAMEPAD
     for (int i = 0; i < GUT_MAX_PADS; i++)
         if (w->pads[i])
             SDL_CloseGamepad(w->pads[i]);
     if (w->owns_gamepad)
         SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
+#endif /* GUTERM_NO_GAMEPAD */
     if (w->owns_video)
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
     free(w);
@@ -3416,6 +3492,7 @@ gut_set_selection(gut_window *w, const struct gut_sel *sel)
         gut_sel_clear(&w->sel);
 }
 
+#ifndef GUTERM_NO_GAMEPAD
 int
 gut_pad_get(const gut_window *w, int slot, struct gut_pad *out)
 {
@@ -3644,6 +3721,8 @@ gut_ticks(const gut_window *w)
 {
     return SDL_GetTicks() - w->t0;
 }
+
+#endif /* GUTERM_NO_GAMEPAD */
 
 /****************************************************************
  * Rendering
@@ -3901,6 +3980,7 @@ gut_flush(gut_window *w, gut_GLuint tex)
     w->nverts = 0;
 }
 
+#ifndef GUTERM_NO_IMAGES
 /* The texture holding a placement's picture, uploaded on first sight.
  * Ids are unique for the process, so the id alone names the picture. */
 static struct gut_texture *
@@ -3995,6 +4075,8 @@ gut_draw_images(gut_window *w, const struct gut_buf *b)
     gut_textures_sweep(w);
 }
 
+#endif /* GUTERM_NO_IMAGES */
+
 void
 gut_present(gut_window *w, struct gut_buf *b)
 {
@@ -4027,9 +4109,11 @@ gut_present(gut_window *w, struct gut_buf *b)
                                   sizeof(struct gut_vertex),
                                   (const void *)(4 * sizeof(float)));
 
+#ifndef GUTERM_NO_IMAGES
     /* pictures lie under the cells: a cell with the default background
      * shows the picture through, a colored one covers it */
     gut_draw_images(w, b);
+#endif /* GUTERM_NO_IMAGES */
 
     /* backgrounds first so glyph overhang (bold shift) stays on top */
     for (int r = 0; r < rows; r++) {
@@ -4355,12 +4439,14 @@ gut_translate(gut_window *w, const SDL_Event *e, struct gut_event *ev)
         ev->dx = (int)e->wheel.x;
         ev->dy = (int)e->wheel.y;
         return 1;
+#ifndef GUTERM_NO_GAMEPAD
     case SDL_EVENT_GAMEPAD_ADDED:
     case SDL_EVENT_GAMEPAD_REMOVED:
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
     case SDL_EVENT_GAMEPAD_BUTTON_UP:
     case SDL_EVENT_GAMEPAD_AXIS_MOTION:
         return gut_translate_pad(w, e, ev);
+#endif /* GUTERM_NO_GAMEPAD */
     default:
         return 0;
     }
@@ -4454,6 +4540,7 @@ static const uint32_t gut_dec_graphics[] = {
     0x252C, 0x2502, 0x2264, 0x2265, 0x03C0, 0x2260, 0x00A3, 0x00B7,
 };
 
+#ifndef GUTERM_NO_SIXEL
 /* ---- sixel decoder ---- */
 
 /* VT340 default colors, in percent. */
@@ -4797,6 +4884,8 @@ gut_sixel_end(struct gut_sixel *s, struct gut_image *out)
     return 1;
 }
 
+#endif /* GUTERM_NO_SIXEL */
+
 /* ---- state helpers ---- */
 
 static void
@@ -4962,7 +5051,9 @@ gut_vt_compose(struct gut_vt *vt)
             out->dirty[r] = 1;
         }
     }
+#ifndef GUTERM_NO_IMAGES
     gut_buf_project_images(out, live, vt->view);
+#endif /* GUTERM_NO_IMAGES */
     out->cursor_visible = 0;
     out->cursor_row = 0;
     out->cursor_col = 0;
@@ -4985,13 +5076,17 @@ gut_vt_view_apply(struct gut_vt *vt, int offset)
         /* park the live screen so the emulator keeps writing to it */
         if (gut_buf_init(&vt->live, out->rows, out->cols) != 0)
             return 0;
+#ifndef GUTERM_NO_IMAGES
         vt->live.image_budget = out->image_budget;
+#endif /* GUTERM_NO_IMAGES */
         memcpy(vt->live.cells, out->cells, bytes);
         vt->live.cursor_row = out->cursor_row;
         vt->live.cursor_col = out->cursor_col;
         vt->live.cursor_visible = out->cursor_visible;
         vt->live.cursor_shape = out->cursor_shape;
+#ifndef GUTERM_NO_IMAGES
         gut_buf_swap_images(&vt->live, &out->images);
+#endif /* GUTERM_NO_IMAGES */
         vt->buf = &vt->live;
     }
     vt->view = offset;
@@ -5001,7 +5096,9 @@ gut_vt_view_apply(struct gut_vt *vt, int offset)
         out->cursor_col = vt->live.cursor_col;
         out->cursor_visible = vt->live.cursor_visible;
         out->cursor_shape = vt->live.cursor_shape;
+#ifndef GUTERM_NO_IMAGES
         gut_buf_swap_images(out, &vt->live.images);
+#endif /* GUTERM_NO_IMAGES */
         gut_buf_dirty_all(out);
         gut_buf_free(&vt->live);
         vt->buf = out;
@@ -5090,8 +5187,10 @@ gut_vt_altscreen_enter(struct gut_vt *vt)
     vt->alt_cursor.fg = vt->fg;
     vt->alt_cursor.bg = vt->bg;
     vt->modes |= GUT_VT_MODE_ALTSCREEN;
+#ifndef GUTERM_NO_IMAGES
     gut_image_list_free(&vt->alt_images);
     gut_buf_swap_images(b, &vt->alt_images);
+#endif /* GUTERM_NO_IMAGES */
     gut_buf_clear(b, gut_color_default());
 }
 
@@ -5108,8 +5207,10 @@ gut_vt_altscreen_leave(struct gut_vt *vt)
                (size_t)b->rows * (size_t)b->cols * sizeof(*b->cells));
     else
         gut_buf_clear(b, gut_color_default());
+#ifndef GUTERM_NO_IMAGES
     gut_buf_swap_images(b, &vt->alt_images);
     gut_image_list_free(&vt->alt_images);
+#endif /* GUTERM_NO_IMAGES */
     gut_buf_dirty_all(b);
     free(vt->alt_saved);
     vt->alt_saved = NULL;
@@ -5311,12 +5412,16 @@ gut_vt_erase_display(struct gut_vt *vt, int mode)
     case 0:
         gut_vt_erase_cols(vt, vt->row, vt->col, b->cols);
         gut_buf_clear_rows(b, vt->row + 1, b->rows, vt->bg);
+#ifndef GUTERM_NO_IMAGES
         gut_buf_cut_images(b, vt->row, vt->row + 1);
+#endif /* GUTERM_NO_IMAGES */
         break;
     case 1:
         gut_buf_clear_rows(b, 0, vt->row, vt->bg);
         gut_vt_erase_cols(vt, vt->row, 0, vt->col + 1);
+#ifndef GUTERM_NO_IMAGES
         gut_buf_cut_images(b, vt->row, vt->row + 1);
+#endif /* GUTERM_NO_IMAGES */
         break;
     case 2:
         gut_buf_clear_rows(b, 0, b->rows, vt->bg);
@@ -5338,7 +5443,9 @@ gut_vt_erase_line(struct gut_vt *vt, int mode)
     case 1: gut_vt_erase_cols(vt, vt->row, 0, vt->col + 1); break;
     case 2:
         gut_vt_erase_cols(vt, vt->row, 0, cols);
+#ifndef GUTERM_NO_IMAGES
         gut_buf_cut_images(vt->buf, vt->row, vt->row + 1);
+#endif /* GUTERM_NO_IMAGES */
         break;
     }
 }
@@ -5424,6 +5531,7 @@ gut_vt_decset(struct gut_vt *vt, int n, int on)
         vt->modes &= ~bit;
 }
 
+#ifndef GUTERM_NO_SIXEL
 /* XTSMGRAPHICS, CSI ? Pi ; Pa ; Pv S: a program asking what pictures
  * it may draw. Item 1 is color registers and 2 the pixel area; the
  * actions read, reset, set and read the maximum all answer with the
@@ -5448,6 +5556,8 @@ gut_vt_graphics_query(struct gut_vt *vt)
     gut_vt_reply_str(vt, rep, (size_t)n);
 }
 
+#endif /* GUTERM_NO_SIXEL */
+
 static void
 gut_vt_csi(struct gut_vt *vt, int final)
 {
@@ -5460,8 +5570,10 @@ gut_vt_csi(struct gut_vt *vt, int final)
         if (final == 'h' || final == 'l')
             for (int i = 0; i < vt->nparam; i++)
                 gut_vt_decset(vt, vt->params[i], final == 'h');
+#ifndef GUTERM_NO_SIXEL
         else if (final == 'S')
             gut_vt_graphics_query(vt);
+#endif
         return;
     }
     if (vt->intermed == ' ' && final == 'q') {
@@ -5556,7 +5668,11 @@ gut_vt_csi(struct gut_vt *vt, int final)
         break;
     case 'c':
         if (gut_vt_param(vt, 0, 0) == 0)
+#ifndef GUTERM_NO_SIXEL
             gut_vt_reply_str(vt, "\033[?1;2;4c", 9);
+#else
+            gut_vt_reply_str(vt, "\033[?1;2c", 7);
+#endif
         break;
     case 'n':
         n = gut_vt_param(vt, 0, 0);
@@ -5841,6 +5957,7 @@ gut_vt_osc_put(struct gut_vt *vt, char c)
 
 /* ---- parser ---- */
 
+#ifndef GUTERM_NO_SIXEL
 /* Pin a finished picture to the screen. With sixel scrolling, the
  * default, it starts at the cursor, the region scrolls to make room
  * for it and for a cursor line below it, a picture taller than that
@@ -5887,6 +6004,8 @@ gut_vt_sixel_finish(struct gut_vt *vt)
     if (gut_sixel_end(&vt->sixel, &img))
         gut_vt_place_image(vt, &img);
 }
+
+#endif /* GUTERM_NO_SIXEL */
 
 static void
 gut_vt_csi_reset(struct gut_vt *vt)
@@ -5957,8 +6076,10 @@ gut_vt_byte(struct gut_vt *vt, unsigned char c)
     if (c == 0x1B) {
         if (vt->state == GUT_ST_OSC_STRING)
             gut_vt_osc(vt);
+#ifndef GUTERM_NO_SIXEL
         if (vt->state == GUT_ST_DCS_SIXEL)
             gut_vt_sixel_finish(vt);
+#endif /* GUTERM_NO_SIXEL */
         vt->utf8_need = 0;
         vt->utf8_len = 0;
         vt->state = GUT_ST_ESCAPE;
@@ -5967,8 +6088,10 @@ gut_vt_byte(struct gut_vt *vt, unsigned char c)
     }
     if (c == 0x18 || c == 0x1A) {
         /* CAN and SUB abandon any string or sequence in progress */
+#ifndef GUTERM_NO_SIXEL
         if (vt->state == GUT_ST_DCS_SIXEL)
             gut_sixel_abort(&vt->sixel);
+#endif /* GUTERM_NO_SIXEL */
         vt->state = GUT_ST_GROUND;
         return;
     }
@@ -6085,21 +6208,24 @@ gut_vt_byte(struct gut_vt *vt, unsigned char c)
             vt->intermed = c;
         } else if (c >= 0x40 && c <= 0x7E) {
             gut_vt_finish_param(vt);
+            vt->state = GUT_ST_DCS_PASSTHRU;
+#ifndef GUTERM_NO_SIXEL
             if (c == 'q' && vt->intermed == 0) {
                 gut_sixel_begin(&vt->sixel, gut_vt_param(vt, 0, 0),
                                 gut_vt_param(vt, 1, 0), gut_vt_param(vt, 2, 0),
                                 vt->image_max_pixels);
                 vt->state = GUT_ST_DCS_SIXEL;
-            } else {
-                vt->state = GUT_ST_DCS_PASSTHRU;
             }
+#endif
         } else {
             vt->state = GUT_ST_DCS_PASSTHRU;
         }
         break;
+#ifndef GUTERM_NO_SIXEL
     case GUT_ST_DCS_SIXEL:
         gut_sixel_put(&vt->sixel, (unsigned char)c);
         break;
+#endif /* GUTERM_NO_SIXEL */
     case GUT_ST_DCS_PASSTHRU:
         /* absorbed until ESC \ arrives; ESC is handled above */
         break;
@@ -6153,8 +6279,12 @@ gut_vt_reset(struct gut_vt *vt)
     vt->wrap_pending = 0;
     memset(&vt->saved, 0, sizeof(vt->saved));
     gut_vt_tab_reset(vt);
+#ifndef GUTERM_NO_SIXEL
     gut_sixel_abort(&vt->sixel);
+#endif
+#ifndef GUTERM_NO_IMAGES
     gut_image_list_free(&vt->alt_images);
+#endif
     vt->state = GUT_ST_GROUND;
     vt->utf8_need = 0;
     vt->utf8_len = 0;
@@ -6172,9 +6302,13 @@ gut_vt_init(struct gut_vt *vt, struct gut_buf *buf)
     memset(vt, 0, sizeof(*vt));
     vt->buf = buf;
     vt->out = buf;
+#ifndef GUTERM_NO_SIXEL
     vt->image_max_pixels = GUT_VT_IMAGE_MAX_PIXELS;
+#endif
+#ifndef GUTERM_NO_IMAGES
     vt->cell_w = 8;
     vt->cell_h = 16;
+#endif
     vt->tabstops = calloc((size_t)buf->cols, 1);
     if (!vt->tabstops)
         return -1;
@@ -6190,8 +6324,12 @@ gut_vt_init(struct gut_vt *vt, struct gut_buf *buf)
 void
 gut_vt_free(struct gut_vt *vt)
 {
+#ifndef GUTERM_NO_SIXEL
     gut_sixel_abort(&vt->sixel);
+#endif
+#ifndef GUTERM_NO_IMAGES
     gut_image_list_free(&vt->alt_images);
+#endif
     gut_vt_sb_free_lines(vt);
     free(vt->sb);
     if (vt->view > 0)
@@ -6272,7 +6410,9 @@ gut_vt_resize(struct gut_vt *vt, int rows, int cols)
         free(tabs);
         return -1;
     }
+#ifndef GUTERM_NO_IMAGES
     gut_image_list_free(&vt->alt_images);   /* a resize drops pictures */
+#endif /* GUTERM_NO_IMAGES */
     for (int c = 0; c < cols; c++)
         tabs[c] = c < old_cols ? vt->tabstops[c] : (c % 8) == 0;
     free(vt->tabstops);
@@ -6321,18 +6461,22 @@ gut_vt_set_scrollback(struct gut_vt *vt, int lines)
     return 0;
 }
 
+#ifndef GUTERM_NO_SIXEL
 void
 gut_vt_set_image_limit(struct gut_vt *vt, size_t max_pixels)
 {
     vt->image_max_pixels = max_pixels ? max_pixels : GUT_VT_IMAGE_MAX_PIXELS;
 }
+#endif /* GUTERM_NO_SIXEL */
 
+#ifndef GUTERM_NO_IMAGES
 void
 gut_vt_set_cell_size(struct gut_vt *vt, int w, int h)
 {
     vt->cell_w = w > 0 ? w : 8;
     vt->cell_h = h > 0 ? h : 16;
 }
+#endif /* GUTERM_NO_IMAGES */
 
 int
 gut_vt_scrollback_lines(const struct gut_vt *vt)
