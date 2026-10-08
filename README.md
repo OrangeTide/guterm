@@ -111,6 +111,10 @@ make cov      # tests with gcov, line report in _out/cov/guterm.h.gcov
 - `examples/term.c` runs `$SHELL` on a pseudo terminal inside the window
   with scrollback on Shift+PageUp and the wheel.
   POSIX only.
+- `examples/reversi.c` is a complete small program: the disc flipping
+  board game with keyboard and mouse play, hints, undo, and a simple
+  computer player for human versus human, human versus computer or
+  computer versus computer.
 - `tests/test_vt.c` checks the buffer, UTF-8, font map, key encoder and
   VT layer, built with `GUTERM_NO_WINDOW`.
 - `tests/torture.c` feeds random byte streams, escape sequences and

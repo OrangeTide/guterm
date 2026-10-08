@@ -125,130 +125,134 @@ main(int argc, char **argv)
     gut_present(w, &buf);
 
     while (running && gut_poll(w, &ev, -1)) {
-        switch (ev.type) {
-        case GUT_EVENT_QUIT:
-            running = 0;
-            break;
-        case GUT_EVENT_RESIZE:
-            gut_buf_resize(&buf, ev.rows, ev.cols);
-            draw_static(&buf);
-            break;
-        case GUT_EVENT_KEY:
-            if (ev.key == GUT_KEY_ESCAPE)
+        /* handle everything queued, then present once */
+        do {
+            switch (ev.type) {
+            case GUT_EVENT_QUIT:
                 running = 0;
-            else if (ev.key == 'c' &&
-                     ev.mods == (GUT_MOD_CTRL | GUT_MOD_SHIFT)) {
-                char text[4096];
-
-                if (gut_sel_text(&sel, &buf, text, sizeof(text)) > 0)
-                    gut_clipboard_set(w, text);
-                snprintf(status, sizeof(status), "copied \"%s\"", text);
                 break;
-            }
-            else if (ev.key == GUT_KEY_F1)
-                buf.cursor_shape = GUT_CURSOR_BLOCK;
-            else if (ev.key == GUT_KEY_F2)
-                buf.cursor_shape = GUT_CURSOR_UNDERLINE;
-            else if (ev.key == GUT_KEY_F3)
-                buf.cursor_shape = GUT_CURSOR_BAR;
-            else if (ev.key == GUT_KEY_ENTER) {
-                echo_row++;
-                echo_col = 2;
-            } else if (ev.key == GUT_KEY_BACKSPACE && echo_col > 2) {
-                echo_col--;
-                gut_buf_put(&buf, echo_row, echo_col, ' ',
-                            gut_color_default(), gut_color_default(), 0);
-            }
-            {
-                char bytes[16];
-                size_t n = gut_encode_event(&ev, bytes, sizeof(bytes), 0);
-                size_t o = 0;
-
-                o = (size_t)snprintf(status, sizeof(status),
-                                     "key 0x%X mods %d%s ->",
-                                     ev.key, ev.mods,
-                                     ev.repeat ? " rep" : "");
-                for (size_t i = 0; i < n && o + 5 < sizeof(status); i++)
-                    o += (size_t)snprintf(status + o, sizeof(status) - o,
-                                          " %02X", (unsigned char)bytes[i]);
-            }
-            break;
-        case GUT_EVENT_TEXT:
-            if (echo_row >= buf.rows - 2) {
-                echo_row = 20;
-                gut_buf_clear_rows(&buf, 20, buf.rows - 2,
-                                   gut_color_default());
-                draw_box(&buf, 0, 0, buf.rows, buf.cols,
-                         gut_color_indexed(8));
-            }
-            echo_col += gut_buf_text(&buf, echo_row, echo_col, ev.text,
-                                     gut_color_indexed(10),
-                                     gut_color_default(), 0);
-            if (echo_col >= buf.cols - 2) {
-                echo_row++;
-                echo_col = 2;
-            }
-            snprintf(status, sizeof(status), "text \"%s\"", ev.text);
-            break;
-        case GUT_EVENT_MOUSE_MOVE:
-        case GUT_EVENT_MOUSE_DOWN:
-        case GUT_EVENT_MOUSE_UP:
-            if (gut_sel_mouse(&sel, &buf, &ev)) {
-                gut_set_selection(w, &sel);
-                if (ev.type == GUT_EVENT_MOUSE_UP) {
+            case GUT_EVENT_RESIZE:
+                gut_buf_resize(&buf, ev.rows, ev.cols);
+                draw_static(&buf);
+                break;
+            case GUT_EVENT_KEY:
+                if (ev.key == GUT_KEY_ESCAPE)
+                    running = 0;
+                else if (ev.key == 'c' &&
+                         ev.mods == (GUT_MOD_CTRL | GUT_MOD_SHIFT)) {
                     char text[4096];
 
                     if (gut_sel_text(&sel, &buf, text, sizeof(text)) > 0)
-                        gut_primary_set(w, text);
+                        gut_clipboard_set(w, text);
+                    snprintf(status, sizeof(status), "copied \"%s\"", text);
+                    break;
                 }
-            }
-            snprintf(status, sizeof(status),
-                     "mouse %s col %d row %d btn %d clicks %d%s",
-                     ev.type == GUT_EVENT_MOUSE_DOWN ? "down"
-                     : ev.type == GUT_EVENT_MOUSE_UP ? "up" : "move",
-                     ev.col, ev.row, ev.button, ev.clicks,
-                     sel.active ? " [selection]" : "");
-            break;
-        case GUT_EVENT_MOUSE_WHEEL:
-            snprintf(status, sizeof(status), "wheel dx %d dy %d", ev.dx,
-                     ev.dy);
-            break;
-        case GUT_EVENT_PASTE:
-            echo_col += gut_buf_text(&buf, echo_row, echo_col, ev.data,
-                                     gut_color_indexed(13),
-                                     gut_color_default(), 0);
-            snprintf(status, sizeof(status), "paste %lu bytes%s",
-                     (unsigned long)ev.len, ev.primary ? " (primary)" : "");
-            break;
-        case GUT_EVENT_COMPOSE:
-            snprintf(status, sizeof(status), "compose \"%s\" caret %d",
-                     ev.data, ev.cursor);
-            break;
-        case GUT_EVENT_PAD_ADDED:
-        case GUT_EVENT_PAD_REMOVED: {
-            struct gut_pad pad;
+                else if (ev.key == GUT_KEY_F1)
+                    buf.cursor_shape = GUT_CURSOR_BLOCK;
+                else if (ev.key == GUT_KEY_F2)
+                    buf.cursor_shape = GUT_CURSOR_UNDERLINE;
+                else if (ev.key == GUT_KEY_F3)
+                    buf.cursor_shape = GUT_CURSOR_BAR;
+                else if (ev.key == GUT_KEY_ENTER) {
+                    echo_row++;
+                    echo_col = 2;
+                } else if (ev.key == GUT_KEY_BACKSPACE && echo_col > 2) {
+                    echo_col--;
+                    gut_buf_put(&buf, echo_row, echo_col, ' ',
+                                gut_color_default(), gut_color_default(), 0);
+                }
+                {
+                    char bytes[16];
+                    size_t n = gut_encode_event(&ev, bytes, sizeof(bytes), 0);
+                    size_t o = 0;
 
-            gut_pad_get(w, ev.pad, &pad);
-            snprintf(status, sizeof(status), "pad %d %s %s", ev.pad,
-                     ev.type == GUT_EVENT_PAD_ADDED ? "added" : "removed",
-                     pad.name);
-            if (ev.type == GUT_EVENT_PAD_ADDED)
-                gut_pad_rumble(w, ev.pad, 0x4000, 0x4000, 200);
-            break;
-        }
-        case GUT_EVENT_PAD_DOWN:
-        case GUT_EVENT_PAD_UP:
-            snprintf(status, sizeof(status), "pad %d button %d %s", ev.pad,
-                     ev.button, ev.type == GUT_EVENT_PAD_DOWN ? "down" : "up");
-            break;
-        case GUT_EVENT_PAD_AXIS:
-            snprintf(status, sizeof(status), "pad %d axis %d %d", ev.pad,
-                     ev.axis, ev.value);
-            break;
-        default:
-            status[0] = '\0';
-            break;
-        }
+                    o = (size_t)snprintf(status, sizeof(status),
+                                         "key 0x%X mods %d%s ->",
+                                         ev.key, ev.mods,
+                                         ev.repeat ? " rep" : "");
+                    for (size_t i = 0; i < n && o + 5 < sizeof(status); i++)
+                        o += (size_t)snprintf(status + o, sizeof(status) - o,
+                                              " %02X", (unsigned char)bytes[i]);
+                }
+                break;
+            case GUT_EVENT_TEXT:
+                if (echo_row >= buf.rows - 2) {
+                    echo_row = 20;
+                    gut_buf_clear_rows(&buf, 20, buf.rows - 2,
+                                       gut_color_default());
+                    draw_box(&buf, 0, 0, buf.rows, buf.cols,
+                             gut_color_indexed(8));
+                }
+                echo_col += gut_buf_text(&buf, echo_row, echo_col, ev.text,
+                                         gut_color_indexed(10),
+                                         gut_color_default(), 0);
+                if (echo_col >= buf.cols - 2) {
+                    echo_row++;
+                    echo_col = 2;
+                }
+                snprintf(status, sizeof(status), "text \"%s\"", ev.text);
+                break;
+            case GUT_EVENT_MOUSE_MOVE:
+            case GUT_EVENT_MOUSE_DOWN:
+            case GUT_EVENT_MOUSE_UP:
+                if (gut_sel_mouse(&sel, &buf, &ev)) {
+                    gut_set_selection(w, &sel);
+                    if (ev.type == GUT_EVENT_MOUSE_UP) {
+                        char text[4096];
+
+                        if (gut_sel_text(&sel, &buf, text, sizeof(text)) > 0)
+                            gut_primary_set(w, text);
+                    }
+                }
+                snprintf(status, sizeof(status),
+                         "mouse %s col %d row %d btn %d clicks %d%s",
+                         ev.type == GUT_EVENT_MOUSE_DOWN ? "down"
+                         : ev.type == GUT_EVENT_MOUSE_UP ? "up" : "move",
+                         ev.col, ev.row, ev.button, ev.clicks,
+                         sel.active ? " [selection]" : "");
+                break;
+            case GUT_EVENT_MOUSE_WHEEL:
+                snprintf(status, sizeof(status), "wheel dx %d dy %d", ev.dx,
+                         ev.dy);
+                break;
+            case GUT_EVENT_PASTE:
+                echo_col += gut_buf_text(&buf, echo_row, echo_col, ev.data,
+                                         gut_color_indexed(13),
+                                         gut_color_default(), 0);
+                snprintf(status, sizeof(status), "paste %lu bytes%s",
+                         (unsigned long)ev.len, ev.primary ? " (primary)" : "");
+                break;
+            case GUT_EVENT_COMPOSE:
+                snprintf(status, sizeof(status), "compose \"%s\" caret %d",
+                         ev.data, ev.cursor);
+                break;
+            case GUT_EVENT_PAD_ADDED:
+            case GUT_EVENT_PAD_REMOVED: {
+                struct gut_pad pad;
+
+                gut_pad_get(w, ev.pad, &pad);
+                snprintf(status, sizeof(status), "pad %d %s %s", ev.pad,
+                         ev.type == GUT_EVENT_PAD_ADDED ? "added" : "removed",
+                         pad.name);
+                if (ev.type == GUT_EVENT_PAD_ADDED)
+                    gut_pad_rumble(w, ev.pad, 0x4000, 0x4000, 200);
+                break;
+            }
+            case GUT_EVENT_PAD_DOWN:
+            case GUT_EVENT_PAD_UP:
+                snprintf(status, sizeof(status), "pad %d button %d %s",
+                         ev.pad, ev.button,
+                         ev.type == GUT_EVENT_PAD_DOWN ? "down" : "up");
+                break;
+            case GUT_EVENT_PAD_AXIS:
+                snprintf(status, sizeof(status), "pad %d axis %d %d", ev.pad,
+                         ev.axis, ev.value);
+                break;
+            default:
+                status[0] = '\0';
+                break;
+            }
+        } while (running && gut_poll(w, &ev, 0));
         buf.cursor_row = echo_row;
         buf.cursor_col = echo_col;
         gut_buf_fill(&buf, buf.rows - 1, 1, 1, buf.cols - 2, 0x2500,

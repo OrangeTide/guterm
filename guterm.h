@@ -3647,8 +3647,21 @@ gut_poll(gut_window *w, struct gut_event *ev, int timeout_ms)
             ev->type = GUT_EVENT_NONE;
             return 0;
         }
-        if (gut_translate(w, &e, ev))
+        if (gut_translate(w, &e, ev)) {
+            /* A fast mouse queues motion faster than a program that
+             * presents per event can drain it. Consecutive motion
+             * events collapse into the latest one; anything else in
+             * between keeps its place. */
+            while (ev->type == GUT_EVENT_MOUSE_MOVE &&
+                   SDL_PeepEvents(&e, 1, SDL_PEEKEVENT, SDL_EVENT_FIRST,
+                                  SDL_EVENT_LAST) == 1 &&
+                   e.type == SDL_EVENT_MOUSE_MOTION) {
+                SDL_PeepEvents(&e, 1, SDL_GETEVENT, SDL_EVENT_FIRST,
+                               SDL_EVENT_LAST);
+                gut_translate(w, &e, ev);
+            }
             return 1;
+        }
         if (timeout_ms == 0 && !SDL_PollEvent(NULL)) {
             ev->type = GUT_EVENT_NONE;
             return 0;

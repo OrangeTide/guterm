@@ -19,7 +19,7 @@ SDL_CFLAGS := $(shell pkg-config --cflags sdl3)
 SDL_LIBS := $(shell pkg-config --libs sdl3)
 
 OUT := _out
-EXAMPLES := $(OUT)/demo $(OUT)/vtdemo
+EXAMPLES := $(OUT)/demo $(OUT)/vtdemo $(OUT)/reversi
 TESTS := $(OUT)/test_vt $(OUT)/torture
 
 TORTURE_ITER ?= 200000
@@ -47,6 +47,9 @@ $(OUT)/demo: examples/demo.c guterm.h | $(OUT)
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -I. -o $@ $< $(SDL_LIBS) -lm
 
 $(OUT)/vtdemo: examples/vtdemo.c guterm.h | $(OUT)
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -I. -o $@ $< $(SDL_LIBS) -lm
+
+$(OUT)/reversi: examples/reversi.c guterm.h | $(OUT)
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -I. -o $@ $< $(SDL_LIBS) -lm
 
 $(OUT)/term: examples/term.c guterm.h | $(OUT)

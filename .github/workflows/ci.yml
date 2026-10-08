@@ -101,7 +101,7 @@ jobs:
           export LD_LIBRARY_PATH="$HOME/sdl3/lib"
           # SDL turns SIGINT into a quit event, so a clean exit after the
           # timeout proves the window and GL context came up.
-          for demo in demo vtdemo; do
+          for demo in demo vtdemo reversi; do
             xvfb-run -a -s "-screen 0 1600x1000x24" \
               timeout --preserve-status -s INT 5 ./_out/$demo
             rc=$?
@@ -136,7 +136,7 @@ jobs:
         run: |
           SDL=sdl3-mingw/x86_64-w64-mingw32
           mkdir -p _out/win
-          for demo in demo vtdemo; do
+          for demo in demo vtdemo reversi; do
             x86_64-w64-mingw32-gcc -std=c99 -O2 -Wall -Wextra -Wpedantic \
               -I. -I"$SDL/include" -o _out/win/$demo.exe examples/$demo.c \
               -L"$SDL/lib" -lSDL3 -lmingw32 -mwindows

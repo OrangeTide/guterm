@@ -1092,7 +1092,11 @@ options:
 every event will be rate limited to the display's refresh when events
 arrive faster than that. Coalescing, by draining pending events with a
 zero timeout before presenting, keeps it responsive under a flood of
-input.
+input. The examples all do this: handle everything that is queued, then
+present once. `gut_poll` helps with the commonest flood by merging a run
+of consecutive mouse motion events into the last one, so a program sees
+the current pointer position rather than every step of its path; an
+event of another type between two motions keeps its place.
 
 ## 14. Portability notes
 

@@ -106,46 +106,50 @@ main(int argc, char **argv)
     gut_present(w, &buf);
 
     while (running && gut_poll(w, &ev, -1)) {
-        char bytes[64];
-        char *big = NULL;
-        char *enc = bytes;
-        size_t n;
+        /* handle everything queued, then present once */
+        do {
+            char bytes[64];
+            char *big = NULL;
+            char *enc = bytes;
+            size_t n;
 
-        switch (ev.type) {
-        case GUT_EVENT_QUIT:
-            running = 0;
-            break;
-        case GUT_EVENT_RESIZE:
-            gut_vt_resize(&vt, ev.rows, ev.cols);
-            break;
-        case GUT_EVENT_KEY:
-            if (ev.key == GUT_KEY_ESCAPE && ev.mods == 0) {
+            switch (ev.type) {
+            case GUT_EVENT_QUIT:
                 running = 0;
                 break;
-            }
-            if (ev.key == GUT_KEY_ENTER && ev.mods == 0) {
-                gut_vt_feed(&vt, "\r\n", 2);
+            case GUT_EVENT_RESIZE:
+                gut_vt_resize(&vt, ev.rows, ev.cols);
+                break;
+            case GUT_EVENT_KEY:
+                if (ev.key == GUT_KEY_ESCAPE && ev.mods == 0) {
+                    running = 0;
+                    break;
+                }
+                if (ev.key == GUT_KEY_ENTER && ev.mods == 0) {
+                    gut_vt_feed(&vt, "\r\n", 2);
+                    break;
+                }
+                if (ev.key == GUT_KEY_BACKSPACE && ev.mods == 0) {
+                    gut_vt_feed(&vt, "\b \b", 3);
+                    break;
+                }
+                /* fall through */
+            case GUT_EVENT_TEXT:
+            case GUT_EVENT_PASTE:
+                /* a paste can be larger than the stack buffer */
+                if (ev.len + 16 > sizeof(bytes))
+                    enc = big = malloc(ev.len + 16);
+                n = gut_encode_event(&ev, enc,
+                                     big ? ev.len + 16 : sizeof(bytes),
+                                     gut_vt_encode_flags(&vt));
+                if (n > 0)
+                    gut_vt_feed(&vt, enc, n);
+                free(big);
+                break;
+            default:
                 break;
             }
-            if (ev.key == GUT_KEY_BACKSPACE && ev.mods == 0) {
-                gut_vt_feed(&vt, "\b \b", 3);
-                break;
-            }
-            /* fall through */
-        case GUT_EVENT_TEXT:
-        case GUT_EVENT_PASTE:
-            /* a paste can be larger than the stack buffer */
-            if (ev.len + 16 > sizeof(bytes))
-                enc = big = malloc(ev.len + 16);
-            n = gut_encode_event(&ev, enc, big ? ev.len + 16 : sizeof(bytes),
-                                 gut_vt_encode_flags(&vt));
-            if (n > 0)
-                gut_vt_feed(&vt, enc, n);
-            free(big);
-            break;
-        default:
-            break;
-        }
+        } while (running && gut_poll(w, &ev, 0));
         gut_present(w, &buf);
     }
 
