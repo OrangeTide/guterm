@@ -34,14 +34,18 @@ bracketed paste, mouse reports and focus reports. Pastes arrive as
 events from the platform chords and middle click, IME composition is
 shown over the cursor and delivered as events, `gut_sel` tracks a mouse
 driven selection that the window highlights, `gut_vt_mouse()` decides
-whether the program or the host gets a mouse event, and up to four game
-controllers report as events.
+whether the program or the host gets a mouse event, up to four game
+controllers report as events, and `gut_key_held()` gives a game the
+keys that are down right now.
 
 ## Documentation
 
 `guterm.md` is the programming manual: concepts, every function, the
 event model, clipboard and input method handling, the VT layer and
 portability notes.
+
+`ROADMAP.md` tracks the open work; the Status section below is its
+short summary.
 
 ## Usage
 
