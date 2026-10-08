@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,6 +41,7 @@ struct app {
     struct gut_sel sel;
     int master;
     pid_t child;
+    int ctrl[2];                /* main loop to watcher: d drained, q quit */
 };
 
 static void
@@ -135,6 +137,52 @@ drain(struct app *a)
             continue;
         return 0;   /* EIO when the child closes its side on Linux */
     }
+}
+
+/* Watcher thread. SDL cannot wait on a descriptor, so this thread does
+ * it: when the child has written something it wakes the main loop, then
+ * waits for the main loop to say it has drained the pty before watching
+ * again, so one wake covers everything that arrived. A hangup or error
+ * on the pty is reported the same way; drain() then sees the end. */
+static void *
+watch_pty(void *arg)
+{
+    struct app *a = arg;
+    struct pollfd pfd[2];
+    char cmd;
+
+    pfd[0].fd = a->master;
+    pfd[0].events = POLLIN;
+    pfd[1].fd = a->ctrl[0];
+    pfd[1].events = POLLIN;
+    for (;;) {
+        pfd[0].revents = pfd[1].revents = 0;
+        if (poll(pfd, 2, -1) < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (pfd[1].revents) {
+            if (read(a->ctrl[0], &cmd, 1) != 1 || cmd == 'q')
+                break;
+            continue;
+        }
+        if (!pfd[0].revents)
+            continue;
+        gut_wake(a->w);
+        do {
+            if (read(a->ctrl[0], &cmd, 1) != 1 || cmd == 'q')
+                return NULL;
+        } while (cmd != 'd');
+    }
+    return NULL;
+}
+
+static void
+tell_watcher(struct app *a, char cmd)
+{
+    while (write(a->ctrl[1], &cmd, 1) < 0 && errno == EINTR)
+        ;
 }
 
 static void resize(struct app *a, int rows, int cols);
@@ -268,6 +316,7 @@ main(void)
     struct gut_desc desc = { 0 };
     struct app a;
     struct gut_event ev;
+    pthread_t watcher;
     int running = 1;
 
     memset(&a, 0, sizeof(a));
@@ -287,31 +336,32 @@ main(void)
     if (spawn_shell(&a, desc.rows, desc.cols) != 0)
         return 1;
     signal(SIGCHLD, SIG_DFL);
+    if (pipe(a.ctrl) != 0 ||
+        pthread_create(&watcher, NULL, watch_pty, &a) != 0) {
+        perror("watcher");
+        return 1;
+    }
 
-    while (running) {
-        struct pollfd pfd = { a.master, POLLIN, 0 };
-        int have_event;
-
-        /* Wait for either the window or the child. SDL has no way to
-         * watch a file descriptor, so this alternates short waits. */
-        have_event = gut_poll(a.w, &ev, 0);
-        if (!have_event) {
-            if (poll(&pfd, 1, 16) > 0) {
+    /* The watcher thread turns child output into GUT_EVENT_WAKE, so the
+     * loop blocks in gut_poll with no idle wakeups. Everything queued is
+     * handled, then the screen is presented once. */
+    while (running && gut_poll(a.w, &ev, -1)) {
+        do {
+            if (ev.type == GUT_EVENT_WAKE) {
                 if (!drain(&a))
-                    break;
-            }
-            have_event = gut_poll(a.w, &ev, 0);
-        }
-        if (have_event) {
-            handle_event(&a, &ev, &running);
-            while (gut_poll(a.w, &ev, 0))
+                    running = 0;
+                tell_watcher(&a, 'd');
+            } else {
                 handle_event(&a, &ev, &running);
-        }
-        if (!drain(&a))
-            break;
+            }
+        } while (running && gut_poll(a.w, &ev, 0));
         gut_present(a.w, &a.buf);
     }
 
+    tell_watcher(&a, 'q');
+    pthread_join(watcher, NULL);
+    close(a.ctrl[0]);
+    close(a.ctrl[1]);
     close(a.master);
     kill(a.child, SIGHUP);
     waitpid(a.child, NULL, 0);

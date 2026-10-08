@@ -446,12 +446,19 @@ since the window opened.
 
 ```c
 int gut_poll(gut_window *w, struct gut_event *ev, int timeout_ms);
+void gut_wake(gut_window *w);
 ```
 
 `gut_poll` waits for the next event and returns 1 with `ev` filled, or 0
 when `timeout_ms` passed with nothing to report. A negative timeout waits
 forever and 0 returns at once. Events SDL delivers that guterm has no use
 for are consumed silently.
+
+`gut_wake` makes a `gut_poll` in progress, or the next one, return a
+`GUT_EVENT_WAKE` event. It is the one window call that may be made from
+another thread. Wakes that pile up before `gut_poll` delivers one
+collapse into a single event, so a program checks its own sources once
+per wake and finds everything that arrived. Section 13 shows the use.
 
 ```c
 struct gut_event {
@@ -495,6 +502,7 @@ fields are meaningful per type:
 | `GUT_EVENT_PAD_DOWN`, `GUT_EVENT_PAD_UP` | `pad`, `button` | A controller button changed; `button` is an `enum gut_pad_button`. |
 | `GUT_EVENT_PAD_AXIS` | `pad`, `axis`, `value` | A stick or trigger moved. |
 | `GUT_EVENT_KEY_UP` | `key`, `mods` | A key was released. |
+| `GUT_EVENT_WAKE` | | `gut_wake` was called, from any thread. |
 
 ### Key state
 
@@ -1119,13 +1127,16 @@ thread, one at a time.
 descriptor or socket. A program with another input source has three
 options:
 
+- Wake: watch the descriptor on another thread and call `gut_wake()`
+  when it is readable. `gut_poll()` returns `GUT_EVENT_WAKE` and the main
+  thread reads the data it was woken for. The main loop keeps blocking
+  with no idle wakeups and no added latency. This is what the shell
+  example does: its watcher thread polls the pty, wakes the main loop,
+  then waits on a pipe for the main loop to say it has drained the pty
+  before watching again, so the two never read the same data.
 - Alternate: poll the window with timeout 0, then the descriptor with a
-  short timeout. This is what the shell example does. Latency is bounded
-  by the short timeout and the cost is a wakeup per period while idle.
-- Push: read the descriptor on another thread and call
-  `SDL_PushEvent()` with a user event to wake `gut_poll()`. guterm
-  ignores user events, so the main thread then handles the data it was
-  woken for. This keeps the main loop blocking with no idle wakeups.
+  short timeout. Latency is bounded by the short timeout and the cost is
+  a wakeup per period while idle. No thread is needed.
 - Timeout: use `gut_poll()` with the time until the next thing the
   program wants to do, for animations and timers.
 
@@ -1236,7 +1247,7 @@ Buffer, no dependencies: `gut_color_default`, `gut_color_indexed`,
 `gut_sel_contains`, `gut_sel_text`.
 
 Window, needs SDL3: `gut_open`, `gut_close`, `gut_error`, `gut_present`,
-`gut_poll`, `gut_grid_size`, `gut_set_grid_size`, `gut_set_title`,
+`gut_poll`, `gut_wake`, `gut_grid_size`, `gut_set_grid_size`, `gut_set_title`,
 `gut_set_defaults`, `gut_set_palette`, `gut_clipboard_get`,
 `gut_clipboard_set`, `gut_primary_get`, `gut_primary_set`,
 `gut_set_text_input`, `gut_set_compose_overlay`, `gut_set_selection`,

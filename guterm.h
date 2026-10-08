@@ -232,6 +232,7 @@ enum gut_event_type {
     GUT_EVENT_PAD_UP,
     GUT_EVENT_PAD_AXIS,     /* pad, axis: enum gut_pad_axis, value */
     GUT_EVENT_KEY_UP,       /* key, mods: a key was released */
+    GUT_EVENT_WAKE,         /* gut_wake() was called */
 };
 
 enum gut_mod {
@@ -444,6 +445,13 @@ GUT_API void gut_present(gut_window *w, struct gut_buf *b);
 /** Wait up to timeout_ms (negative waits forever, 0 does not wait) for
  * an event. Returns 1 with ev filled, or 0 when the timeout passed. */
 GUT_API int gut_poll(gut_window *w, struct gut_event *ev, int timeout_ms);
+
+/** Make a gut_poll() in progress, or the next one, return a
+ * GUT_EVENT_WAKE event. The one call that may be made from another
+ * thread, for a reader that waits on a descriptor or socket and wants
+ * the main loop to act on what arrived. Wakes queued before gut_poll()
+ * delivers one collapse into a single event. */
+GUT_API void gut_wake(gut_window *w);
 
 /** Grid cells that fit in the window at its current size. */
 GUT_API void gut_grid_size(const gut_window *w, int *cols, int *rows);
@@ -2511,6 +2519,7 @@ struct gut_window {
     int held[64];               /* keys down, by gut_key code */
     int nheld;
     int mouse_held;             /* bit (1 << gut_button) per button */
+    uint32_t wake_type;         /* SDL user event pushed by gut_wake */
 };
 
 static const uint32_t gut_default_palette[16] = {
@@ -2841,6 +2850,7 @@ gut_open(const struct gut_desc *desc)
     SDL_GL_SetSwapInterval(1);
     SDL_StartTextInput(w->win);
     w->t0 = SDL_GetTicks();
+    w->wake_type = SDL_RegisterEvents(1);
     return w;
 }
 
@@ -3613,6 +3623,13 @@ gut_translate(gut_window *w, const SDL_Event *e, struct gut_event *ev)
     ev->cursor = -1;
     ev->mods = gut_mods_from_sdl(SDL_GetModState());
 
+    if (e->type == w->wake_type) {
+        /* One wake is as good as many: the program checks its own
+         * sources once and finds everything that arrived. */
+        SDL_FlushEvent(w->wake_type);
+        ev->type = GUT_EVENT_WAKE;
+        return 1;
+    }
     switch (e->type) {
     case SDL_EVENT_QUIT:
     case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
@@ -3769,6 +3786,16 @@ gut_poll(gut_window *w, struct gut_event *ev, int timeout_ms)
             return 0;
         }
     }
+}
+
+void
+gut_wake(gut_window *w)
+{
+    SDL_Event e;
+
+    SDL_zero(e);
+    e.type = w->wake_type;
+    SDL_PushEvent(&e);
 }
 
 #endif /* GUTERM_NO_WINDOW */

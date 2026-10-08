@@ -7,12 +7,6 @@ things.
 
 ## Next
 
-- Wake `gut_poll` from a file descriptor or another thread. SDL cannot
-  wait on a descriptor, so a host with other input (gvedit's terminal
-  panel ptys) alternates short waits today, with 16 ms latency and idle
-  wakeups. A helper thread that pushes an SDL user event when a
-  descriptor is readable, or a `gut_wake()` callable from any thread,
-  removes both.
 - Run gvedit on a real high density display. Auto scale (`gut_desc.scale`
   of 0) has only exercised the 1x branch, since Xvfb reports a content
   scale of 1.0.

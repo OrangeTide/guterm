@@ -53,7 +53,7 @@ $(OUT)/reversi: examples/reversi.c guterm.h | $(OUT)
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -I. -o $@ $< $(SDL_LIBS) -lm
 
 $(OUT)/term: examples/term.c guterm.h | $(OUT)
-	$(CC) $(CFLAGS) -D_GNU_SOURCE $(SDL_CFLAGS) -I. -o $@ $< \
+	$(CC) $(CFLAGS) -pthread -D_GNU_SOURCE $(SDL_CFLAGS) -I. -o $@ $< \
 	    $(SDL_LIBS) -lutil -lm
 
 $(OUT)/test_vt: tests/test_vt.c guterm.h | $(OUT)
