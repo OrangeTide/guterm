@@ -306,7 +306,9 @@ the region's edge is split there, so the part outside stays put.
 `gut_buf_clear_rows` and `gut_buf_clear` cut the rows cleared, which may
 leave the bands above and below as two placements sharing one
 picture. Text written over a placement does not disturb it: the cells
-are drawn over the picture. `gut_buf_resize` drops every placement.
+are drawn over the picture. Writing to cells does not touch placements
+either; a host that wants a cell erase to remove a picture cuts the
+row with `gut_buf_cut_images`. `gut_buf_resize` drops every placement.
 That is the documented behavior, not a gap: a resize changes the cell
 size and the layout, and the program that placed the picture is the
 one that knows whether and where to place it again.
@@ -315,14 +317,17 @@ The pictures count toward a budget in pixels, `GUT_BUF_IMAGE_BUDGET`
 unless `gut_buf_set_image_budget` says otherwise. When a new picture
 needs room the oldest placements are discarded first, by placement
 time, so the two bands of a split picture go together. A picture
-larger than the whole budget is refused.
+larger than the whole budget is refused. The bands on screen are also
+capped at `GUT_BUF_IMAGE_MAX_PLACEMENTS`, evicting the oldest the same
+way, so a flood of tiny pictures cannot grow the list without bound.
 
 `gut_buf_images` hands the placements to a renderer. Each
 `struct gut_placement` names its picture through `ref`, shared by the
 bands of a split, and the band of it to show: image rows from `src_y`
 for `rows * cell_h` pixels or to the bottom of the picture, drawn with
 its top left at `(row, col)`. `ref->id` is stable across splits and
-scrolls, so a renderer can cache one texture per picture. A host that
+scrolls and unique for the whole process, so a renderer can cache one
+texture per picture by id alone. A host that
 draws the cells itself and does not want pictures can ignore the list;
 nothing in the cell API changes.
 
@@ -1064,8 +1069,9 @@ A sixel picture, DCS q, is decoded as it streams by `gut_sixel_begin`,
 `gut_sixel_put` and `gut_sixel_end`, which a program may also use on
 their own, and placed on the screen with `gut_buf_place_image` as
 section 4 describes. `gut_vt_set_image_limit` bounds a picture in
-pixels, `GUT_VT_IMAGE_MAX_PIXELS` by default; a larger one is dropped
-and the rest of its data ignored. The buffer's own budget bounds what
+pixels, `GUT_VT_IMAGE_MAX_PIXELS` by default, and `GUT_SIXEL_MAX_DIM`
+bounds each side; a larger one is dropped and the rest of its data
+ignored. CAN or SUB in the data abandons the picture. The buffer's own budget bounds what
 all the pictures hold together.
 
 `gut_vt_set_cell_size` tells the emulator how many pixels a cell is,
@@ -1081,8 +1087,9 @@ picture taller than the region loses its top, as it would on a
 terminal that drew it band by band. With DECSDM, DECSET 80, the
 picture sits at the home position and the cursor stays put.
 
-Pictures follow the text: they scroll with it, are cut by erases, go
-with the alternate screen and come back with the primary one, and show
+Pictures follow the text: they scroll with it, are cut by erases that
+cover a whole row (ED and EL 2, including the cursor's row for ED 0
+and 1; EL 0, EL 1 and ECH leave them), go with the alternate screen and come back with the primary one, and show
 in a scrolled back view at their place below the scrollback lines.
 Lines that scroll off the top take their part of a picture with them;
 the scrollback keeps text only. A resize drops every picture, the

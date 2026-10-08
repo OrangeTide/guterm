@@ -233,21 +233,29 @@ test_images(void)
     gut_buf_set_image_budget(&b, 0);
     gut_buf_drop_images(&b);
 
+    /* the placement cap evicts the oldest bands too */
+    for (int i = 0; i < GUT_BUF_IMAGE_MAX_PLACEMENTS + 10; i++) {
+        img = make_image(1, 1);
+        CHECK(gut_buf_place_image(&b, &img, i % 3, 0, 8, 16) > 0);
+    }
+    CHECK(placements(&b) == GUT_BUF_IMAGE_MAX_PLACEMENTS);
+    gut_buf_drop_images(&b);
+
     /* parking a screen's pictures and bringing them back */
     memset(&parked, 0, sizeof(parked));
     img = make_image(8, 16);
-    CHECK(gut_buf_place_image(&b, &img, 0, 0, 8, 16) == 11);
+    CHECK(gut_buf_place_image(&b, &img, 0, 0, 8, 16) > 0);
     gut_buf_swap_images(&b, &parked);
     CHECK(placements(&b) == 0 && parked.n == 1 && parked.pixels == 128);
     img = make_image(8, 16);
-    CHECK(gut_buf_place_image(&b, &img, 1, 0, 8, 16) == 12);
+    CHECK(gut_buf_place_image(&b, &img, 1, 0, 8, 16) > 0);
     gut_buf_swap_images(&b, &parked);
     CHECK(placements(&b) == 1 && placement_at(&b, 0) != NULL);
     CHECK(parked.n == 1 && placement_at(&b, 1) == NULL);
     /* a parked list is clipped to the grid it comes back to */
     CHECK(gut_buf_resize(&b, 3, 12) == 0);
     img = make_image(8, 64);
-    CHECK(gut_buf_place_image(&b, &img, 1, 0, 8, 16) == 13);
+    CHECK(gut_buf_place_image(&b, &img, 1, 0, 8, 16) > 0);
     gut_buf_swap_images(&b, &parked);
     CHECK(gut_buf_resize(&b, 2, 12) == 0);
     gut_buf_swap_images(&b, &parked);
@@ -260,9 +268,9 @@ test_images(void)
     /* and to the budget */
     CHECK(gut_buf_resize(&b, 4, 12) == 0);
     img = make_image(8, 16);
-    CHECK(gut_buf_place_image(&b, &img, 0, 0, 8, 16) == 14);
+    CHECK(gut_buf_place_image(&b, &img, 0, 0, 8, 16) > 0);
     img = make_image(8, 16);
-    CHECK(gut_buf_place_image(&b, &img, 1, 0, 8, 16) == 15);
+    CHECK(gut_buf_place_image(&b, &img, 1, 0, 8, 16) > 0);
     gut_buf_swap_images(&b, &parked);
     gut_buf_set_image_budget(&b, 200);
     gut_buf_swap_images(&b, &parked);
@@ -1216,6 +1224,13 @@ test_sixel(void)
     CHECK(gut_sixel_end(&s, &img) == 0);
     gut_sixel_abort(&s);
 
+    /* a side longer than GUT_SIXEL_MAX_DIM fails the picture */
+    CHECK(sixel(&img, 1, 0, "!4097@") == 0);
+    CHECK(sixel(&img, 1, 0, "\"1;1;1;4097") == 0);
+    CHECK(sixel(&img, 1, 0, "!4096@") == 1);
+    CHECK(img.w == 4096);
+    gut_image_free(&img);
+
     /* through the VT: the DCS is consumed, the picture is placed and
      * the cursor moves below it; a DCS that is not sixel is swallowed,
      * and controls inside a picture do not execute */
@@ -1244,6 +1259,10 @@ test_sixel(void)
     gut_vt_set_image_limit(&vt, 4);
     feed(&vt, "\033Pq!100~\033\\I");
     CHECK(strcmp(row_text(&b, 0), "HI") == 0 && placements(&b) == 0);
+    /* CAN abandons a picture and the bytes after it are text */
+    gut_vt_set_image_limit(&vt, 0);
+    feed(&vt, "\033Pq#1~\030J");
+    CHECK(strcmp(row_text(&b, 0), "HIJ") == 0 && placements(&b) == 0);
     gut_vt_free(&vt);
     gut_buf_free(&b);
 }
@@ -1340,6 +1359,19 @@ test_vt_images(void)
     CHECK(placement_at(&b, 4) != NULL);
     CHECK(gut_vt_set_view(&vt, 0) == 0);
     CHECK(placements(&b) == 2 && placement_at(&b, 0) != NULL);
+
+    /* EL 2 and the cursor row of ED cut a picture; ECH and EL 0 leave it */
+    feed(&vt, "\033[2J\033[1;1H");
+    feed_bands(&vt, 3);
+    CHECK(placements(&b) == 1 && placement_at(&b, 0) != NULL);
+    feed(&vt, "\033[2;1H\033[3X\033[0K");
+    CHECK(placements(&b) == 1);
+    feed(&vt, "\033[2K");
+    CHECK(placements(&b) == 2 && placement_at(&b, 1) == NULL);
+    feed(&vt, "\033[3;1H\033[0J");
+    CHECK(placements(&b) == 1 && placement_at(&b, 0) != NULL);
+    feed(&vt, "\033[1;1H\033[1J");
+    CHECK(placements(&b) == 0);
 
     /* queries */
     feed(&vt, "\033[?2;1;0S");

@@ -59,6 +59,10 @@ things.
   that composes them.
 - Erasing a picture cell by cell as xterm does. Text draws over a
   picture and only whole row erases and colored backgrounds remove it.
+- A picture wider than the window's GL texture limit draws as nothing.
+  `GUT_SIXEL_MAX_DIM` keeps sixel pictures under 4096 a side, which
+  every GLES2 device of the last decade holds; a host placing its own
+  larger pictures gets a blank.
 - Scrollback search, or a host API to read scrollback lines rather than
   only view them.
 - Answering OSC 52 queries in the shell example, behind a setting.

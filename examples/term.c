@@ -144,6 +144,19 @@ drain(struct app *a)
  * waits for the main loop to say it has drained the pty before watching
  * again, so one wake covers everything that arrived. A hangup or error
  * on the pty is reported the same way; drain() then sees the end. */
+/* One command from the main loop, or q when the pipe is gone. */
+static char
+read_cmd(struct app *a)
+{
+    char cmd;
+    ssize_t n;
+
+    do {
+        n = read(a->ctrl[0], &cmd, 1);
+    } while (n < 0 && errno == EINTR);
+    return n == 1 ? cmd : 'q';
+}
+
 static void *
 watch_pty(void *arg)
 {
@@ -163,7 +176,7 @@ watch_pty(void *arg)
             break;
         }
         if (pfd[1].revents) {
-            if (read(a->ctrl[0], &cmd, 1) != 1 || cmd == 'q')
+            if (read_cmd(a) == 'q')
                 break;
             continue;
         }
@@ -171,7 +184,8 @@ watch_pty(void *arg)
             continue;
         gut_wake(a->w);
         do {
-            if (read(a->ctrl[0], &cmd, 1) != 1 || cmd == 'q')
+            cmd = read_cmd(a);
+            if (cmd == 'q')
                 return NULL;
         } while (cmd != 'd');
     }
