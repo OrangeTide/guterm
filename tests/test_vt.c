@@ -83,6 +83,199 @@ test_buf(void)
     gut_buf_free(&b);
 }
 
+static struct gut_image
+make_image(int w, int h)
+{
+    struct gut_image img;
+
+    img.w = w;
+    img.h = h;
+    img.rgba = calloc((size_t)w * h, 4);
+    return img;
+}
+
+static const struct gut_placement *
+placement_at(const struct gut_buf *b, int row)
+{
+    int n;
+    const struct gut_placement *p = gut_buf_images(b, &n);
+
+    for (int i = 0; i < n; i++)
+        if (p[i].row == row)
+            return &p[i];
+    return NULL;
+}
+
+static int
+placements(const struct gut_buf *b)
+{
+    int n;
+
+    gut_buf_images(b, &n);
+    return n;
+}
+
+static void
+test_images(void)
+{
+    struct gut_buf b;
+    struct gut_image img;
+    struct gut_image_list parked;
+    const struct gut_placement *p;
+
+    CHECK(gut_buf_init(&b, 6, 10) == 0);
+
+    /* geometry from the picture size and the cell size */
+    img = make_image(16, 32);
+    memset(b.dirty, 0, 6);
+    CHECK(gut_buf_place_image(&b, &img, 1, 2, 8, 16) == 1);
+    CHECK(img.rgba == NULL && img.w == 0);
+    p = placement_at(&b, 1);
+    CHECK(p && p->col == 2 && p->rows == 2 && p->cols == 2 && p->src_y == 0);
+    CHECK(p->ref->id == 1 && p->ref->refs == 1 && p->ref->img.h == 32);
+    CHECK(!b.dirty[0] && b.dirty[1] && b.dirty[2] && !b.dirty[3]);
+    CHECK(b.images.pixels == 16 * 32);
+
+    /* scrolling moves it, then cuts it row by row at the top */
+    gut_buf_scroll(&b, 0, 6, 1, gut_color_default());
+    p = placement_at(&b, 0);
+    CHECK(p && p->rows == 2 && p->src_y == 0);
+    gut_buf_scroll(&b, 0, 6, 1, gut_color_default());
+    p = placement_at(&b, 0);
+    CHECK(p && p->rows == 1 && p->src_y == 16);
+    gut_buf_scroll(&b, 0, 6, 1, gut_color_default());
+    CHECK(placements(&b) == 0 && b.images.pixels == 0);
+
+    /* clearing rows inside a picture leaves two bands sharing pixels */
+    img = make_image(8, 64);
+    CHECK(gut_buf_place_image(&b, &img, 0, 0, 8, 16) == 2);
+    gut_buf_clear_rows(&b, 1, 2, gut_color_default());
+    CHECK(placements(&b) == 2);
+    p = placement_at(&b, 0);
+    CHECK(p && p->rows == 1 && p->src_y == 0 && p->ref->refs == 2);
+    p = placement_at(&b, 2);
+    CHECK(p && p->rows == 2 && p->src_y == 32 && p->ref->id == 2);
+    CHECK(b.images.pixels == 8 * 64);
+    gut_buf_clear_rows(&b, 0, 1, gut_color_default());
+    CHECK(placements(&b) == 1 && b.images.pixels == 8 * 64);
+    p = placement_at(&b, 2);
+    CHECK(p && p->ref->refs == 1);
+    gut_buf_clear(&b, gut_color_default());
+    CHECK(placements(&b) == 0 && b.images.pixels == 0);
+
+    /* a scroll region: the part outside stays, the part inside moves */
+    img = make_image(8, 64);
+    CHECK(gut_buf_place_image(&b, &img, 0, 0, 8, 16) == 3);
+    gut_buf_scroll(&b, 2, 4, 1, gut_color_default());
+    CHECK(placements(&b) == 2);
+    p = placement_at(&b, 0);
+    CHECK(p && p->rows == 2 && p->src_y == 0);
+    p = placement_at(&b, 2);
+    CHECK(p && p->rows == 1 && p->src_y == 48);
+    /* scrolling down cuts at the bottom of the region */
+    gut_buf_scroll(&b, 0, 2, -1, gut_color_default());
+    p = placement_at(&b, 1);
+    CHECK(p && p->rows == 1 && p->src_y == 0);
+    CHECK(placement_at(&b, 0) == NULL);
+    /* a scroll as large as the region clears it */
+    gut_buf_scroll(&b, 0, 6, 6, gut_color_default());
+    CHECK(placements(&b) == 0);
+
+    /* rows below the grid are cut off, bad positions are refused */
+    img = make_image(8, 64);
+    CHECK(gut_buf_place_image(&b, &img, 4, 9, 8, 16) == 4);
+    p = placement_at(&b, 4);
+    CHECK(p && p->rows == 2 && p->cols == 1);
+    img = make_image(8, 8);
+    CHECK(gut_buf_place_image(&b, &img, 6, 0, 8, 16) == -1);
+    CHECK(img.rgba == NULL);
+    img = make_image(8, 8);
+    CHECK(gut_buf_place_image(&b, &img, 0, 0, 0, 16) == -1);
+    img.rgba = NULL;
+    img.w = 8;
+    img.h = 8;
+    CHECK(gut_buf_place_image(&b, &img, 0, 0, 8, 16) == -1);
+    CHECK(placements(&b) == 1);
+
+    /* a resize drops everything */
+    CHECK(gut_buf_resize(&b, 6, 12) == 0);
+    CHECK(placements(&b) == 0 && b.images.pixels == 0);
+
+    /* the budget evicts the oldest; one picture over it is refused */
+    gut_buf_set_image_budget(&b, 1000);
+    img = make_image(30, 20);
+    CHECK(gut_buf_place_image(&b, &img, 0, 0, 8, 16) == 5);
+    img = make_image(10, 30);
+    CHECK(gut_buf_place_image(&b, &img, 2, 0, 8, 16) == 6);
+    CHECK(placements(&b) == 2 && b.images.pixels == 900);
+    img = make_image(10, 20);
+    CHECK(gut_buf_place_image(&b, &img, 4, 0, 8, 16) == 7);
+    CHECK(placements(&b) == 2 && b.images.pixels == 500);
+    CHECK(placement_at(&b, 0) == NULL && placement_at(&b, 2) != NULL);
+    img = make_image(40, 30);
+    CHECK(gut_buf_place_image(&b, &img, 0, 0, 8, 16) == -1);
+    CHECK(placements(&b) == 2 && b.images.pixels == 500);
+    img = make_image(20, 30);
+    CHECK(gut_buf_place_image(&b, &img, 0, 0, 8, 16) == 8);
+    CHECK(placements(&b) == 2 && b.images.pixels == 800);
+    CHECK(placement_at(&b, 0) != NULL && placement_at(&b, 2) == NULL);
+    gut_buf_set_image_budget(&b, 599);
+    CHECK(placements(&b) == 0);
+    /* both bands of a split picture go together, as the oldest */
+    gut_buf_set_image_budget(&b, 1000);
+    img = make_image(8, 64);
+    CHECK(gut_buf_place_image(&b, &img, 0, 0, 8, 16) == 9);
+    gut_buf_clear_rows(&b, 1, 2, gut_color_default());
+    CHECK(placements(&b) == 2 && b.images.pixels == 512);
+    img = make_image(20, 30);
+    CHECK(gut_buf_place_image(&b, &img, 0, 0, 8, 16) == 10);
+    CHECK(placements(&b) == 1 && b.images.pixels == 600);
+    gut_buf_set_image_budget(&b, 0);
+    gut_buf_drop_images(&b);
+
+    /* parking a screen's pictures and bringing them back */
+    memset(&parked, 0, sizeof(parked));
+    img = make_image(8, 16);
+    CHECK(gut_buf_place_image(&b, &img, 0, 0, 8, 16) == 11);
+    gut_buf_swap_images(&b, &parked);
+    CHECK(placements(&b) == 0 && parked.n == 1 && parked.pixels == 128);
+    img = make_image(8, 16);
+    CHECK(gut_buf_place_image(&b, &img, 1, 0, 8, 16) == 12);
+    gut_buf_swap_images(&b, &parked);
+    CHECK(placements(&b) == 1 && placement_at(&b, 0) != NULL);
+    CHECK(parked.n == 1 && placement_at(&b, 1) == NULL);
+    /* a parked list is clipped to the grid it comes back to */
+    CHECK(gut_buf_resize(&b, 3, 12) == 0);
+    img = make_image(8, 64);
+    CHECK(gut_buf_place_image(&b, &img, 1, 0, 8, 16) == 13);
+    gut_buf_swap_images(&b, &parked);
+    CHECK(gut_buf_resize(&b, 2, 12) == 0);
+    gut_buf_swap_images(&b, &parked);
+    p = placement_at(&b, 1);
+    CHECK(placements(&b) == 1 && p && p->rows == 1);
+    gut_buf_swap_images(&b, &parked);
+    CHECK(gut_buf_resize(&b, 1, 12) == 0);
+    gut_buf_swap_images(&b, &parked);
+    CHECK(placements(&b) == 0);
+    /* and to the budget */
+    CHECK(gut_buf_resize(&b, 4, 12) == 0);
+    img = make_image(8, 16);
+    CHECK(gut_buf_place_image(&b, &img, 0, 0, 8, 16) == 14);
+    img = make_image(8, 16);
+    CHECK(gut_buf_place_image(&b, &img, 1, 0, 8, 16) == 15);
+    gut_buf_swap_images(&b, &parked);
+    gut_buf_set_image_budget(&b, 200);
+    gut_buf_swap_images(&b, &parked);
+    CHECK(placements(&b) == 1 && placement_at(&b, 1) != NULL);
+    gut_buf_set_image_budget(&b, 0);
+    gut_image_list_free(&parked);
+    CHECK(parked.n == 0 && parked.v == NULL);
+    gut_buf_drop_images(&b);
+    CHECK(placements(&b) == 0);
+
+    gut_buf_free(&b);
+}
+
 static void
 test_utf8(void)
 {
@@ -1058,6 +1251,7 @@ int
 main(void)
 {
     test_buf();
+    test_images();
     test_utf8();
     test_font();
     test_encode();

@@ -98,6 +98,45 @@ GUT_API void gut_cell_erase(struct gut_cell *c, struct gut_color bg);
  * Cell buffer
  ****************************************************************/
 
+/* ---- images ---- */
+
+/** A picture: w by h pixels of RGBA, row major, 4 bytes each, alpha 0
+ * where nothing was painted. */
+struct gut_image {
+    int w, h;
+    uint8_t *rgba;
+};
+
+GUT_API void gut_image_free(struct gut_image *img);
+
+/* Pixels shared by the placements that show parts of one picture. */
+struct gut_image_ref {
+    int id;                     /* unique within the buffer, from 1 */
+    int refs;
+    struct gut_image img;
+};
+
+/** A picture, or a horizontal band of one, pinned to the grid. The band
+ * is the image rows from src_y for rows * cell_h pixels, or to the
+ * bottom of the picture, drawn with its top left at cell (row, col),
+ * one image pixel per cell_w by cell_h pixel of the cell. */
+struct gut_placement {
+    struct gut_image_ref *ref;
+    int row, col;
+    int rows, cols;             /* cells covered */
+    int cell_w, cell_h;         /* pixels per cell when placed */
+    int src_y;
+    unsigned seq;               /* placement order, lowest is oldest */
+};
+
+struct gut_image_list {
+    struct gut_placement *v;
+    int n, cap;
+    size_t pixels;              /* held by the pictures referenced */
+};
+
+#define GUT_BUF_IMAGE_BUDGET (1 << 24)      /* pixels, 64 MiB of RGBA */
+
 enum gut_cursor_shape {
     GUT_CURSOR_BLOCK,
     GUT_CURSOR_UNDERLINE,
@@ -111,6 +150,10 @@ struct gut_buf {
     int cursor_row, cursor_col;
     int cursor_visible;
     int cursor_shape;           /* enum gut_cursor_shape */
+    struct gut_image_list images;
+    size_t image_budget;        /* pixels the list may hold */
+    unsigned image_seq;
+    int image_next_id;
 };
 
 /** Allocate a rows by cols grid of blank cells. Returns 0 or -1. */
@@ -156,6 +199,40 @@ GUT_API void gut_buf_scroll(struct gut_buf *b, int top, int bot, int count,
                             struct gut_color bg);
 
 GUT_API void gut_buf_dirty_all(struct gut_buf *b);
+
+/** Pin a picture to the grid with its top left at cell (row, col), each
+ * cell showing cell_w by cell_h of its pixels. The buffer takes the
+ * pixels whether or not it keeps them: img is empty afterwards. Rows
+ * below the grid are cut off. Older pictures are discarded, oldest
+ * first, until the budget has room; a picture larger than the whole
+ * budget is dropped. Returns the picture's id, or -1 when it was not
+ * placed. Scrolling moves placements with their rows and cuts off what
+ * leaves the region, clearing rows cuts the rows cleared, and a resize
+ * drops every placement. */
+GUT_API int gut_buf_place_image(struct gut_buf *b, struct gut_image *img,
+                                int row, int col, int cell_w, int cell_h);
+
+/** Pixels the placements may hold between them, 0 for the default
+ * GUT_BUF_IMAGE_BUDGET. Shrinking discards the oldest to fit. */
+GUT_API void gut_buf_set_image_budget(struct gut_buf *b, size_t pixels);
+
+/** The placements, for a renderer. n receives the count. */
+GUT_API const struct gut_placement *gut_buf_images(const struct gut_buf *b,
+                                                   int *n);
+
+/** Cut rows from (inclusive) to to (exclusive) out of every placement,
+ * as clearing those rows does. */
+GUT_API void gut_buf_cut_images(struct gut_buf *b, int from, int to);
+
+/** Drop every placement. */
+GUT_API void gut_buf_drop_images(struct gut_buf *b);
+
+/** Exchange the buffer's placements with a list held elsewhere, so a
+ * screen can be parked and brought back. A parked list keeps its
+ * pixels outside the budget; free it with gut_image_list_free. */
+GUT_API void gut_buf_swap_images(struct gut_buf *b,
+                                 struct gut_image_list *other);
+GUT_API void gut_image_list_free(struct gut_image_list *list);
 
 enum gut_copy_mode {
     GUT_COPY_STREAM,    /* reading order from start to end, inclusive */
@@ -567,17 +644,6 @@ struct gut_vt_saved {
     uint16_t attrs;
     struct gut_color fg, bg;
 };
-
-/* ---- images ---- */
-
-/** A decoded picture: w by h pixels of RGBA, row major, 4 bytes each,
- * alpha 0 where nothing was painted. */
-struct gut_image {
-    int w, h;
-    uint8_t *rgba;
-};
-
-GUT_API void gut_image_free(struct gut_image *img);
 
 #define GUT_SIXEL_COLORS 256
 #define GUT_VT_IMAGE_MAX_PIXELS (1 << 22)   /* 2048 by 2048 */
@@ -998,6 +1064,283 @@ gut_rune_width(uint32_t cp)
  * Cell buffer
  ****************************************************************/
 
+/* ---- images ---- */
+
+void
+gut_image_free(struct gut_image *img)
+{
+    free(img->rgba);
+    img->rgba = NULL;
+    img->w = 0;
+    img->h = 0;
+}
+
+static void
+gut_image_ref_drop(struct gut_image_list *l, struct gut_image_ref *ref)
+{
+    if (--ref->refs > 0)
+        return;
+    l->pixels -= (size_t)ref->img.w * (size_t)ref->img.h;
+    gut_image_free(&ref->img);
+    free(ref);
+}
+
+static void
+gut_images_dirty(struct gut_buf *b, const struct gut_placement *p)
+{
+    int from = p->row < 0 ? 0 : p->row;
+    int to = p->row + p->rows > b->rows ? b->rows : p->row + p->rows;
+
+    for (int r = from; r < to; r++)
+        b->dirty[r] = 1;
+}
+
+static void
+gut_images_remove(struct gut_buf *b, int i)
+{
+    struct gut_image_list *l = &b->images;
+
+    gut_images_dirty(b, &l->v[i]);
+    gut_image_ref_drop(l, l->v[i].ref);
+    l->v[i] = l->v[l->n - 1];
+    l->n--;
+}
+
+static struct gut_placement *
+gut_images_append(struct gut_buf *b)
+{
+    struct gut_image_list *l = &b->images;
+
+    if (l->n == l->cap) {
+        int cap = l->cap ? l->cap * 2 : 8;
+        struct gut_placement *v = realloc(l->v, (size_t)cap * sizeof(*v));
+
+        if (!v)
+            return NULL;
+        l->v = v;
+        l->cap = cap;
+    }
+    return &l->v[l->n++];
+}
+
+/* Discard the oldest placements until the list holds at most keep
+ * pixels. */
+static void
+gut_images_evict(struct gut_buf *b, size_t keep)
+{
+    struct gut_image_list *l = &b->images;
+
+    while (l->pixels > keep && l->n > 0) {
+        int oldest = 0;
+
+        for (int i = 1; i < l->n; i++)
+            if (l->v[i].seq < l->v[oldest].seq)
+                oldest = i;
+        gut_images_remove(b, oldest);
+    }
+}
+
+/* Split any placement that spans row so none crosses it; the halves
+ * share the pixels. */
+static int
+gut_images_split(struct gut_buf *b, int row)
+{
+    struct gut_image_list *l = &b->images;
+    int n = l->n;
+
+    for (int i = 0; i < n; i++) {
+        struct gut_placement *p = &l->v[i], *q;
+        int above;
+
+        if (row <= p->row || row >= p->row + p->rows)
+            continue;
+        above = row - p->row;
+        q = gut_images_append(b);
+        if (!q)
+            return -1;
+        p = &l->v[i];       /* the append may have moved the array */
+        *q = *p;
+        q->ref->refs++;
+        q->row = row;
+        q->rows = p->rows - above;
+        q->src_y = p->src_y + above * p->cell_h;
+        p->rows = above;
+    }
+    return 0;
+}
+
+void
+gut_buf_cut_images(struct gut_buf *b, int from, int to)
+{
+    struct gut_image_list *l = &b->images;
+
+    if (from >= to)
+        return;
+    /* a cut strictly inside a placement leaves two bands; on an
+     * allocation failure the whole placement goes instead */
+    if (gut_images_split(b, to) != 0) {
+        for (int i = l->n - 1; i >= 0; i--)
+            if (l->v[i].row < to && l->v[i].row + l->v[i].rows > from)
+                gut_images_remove(b, i);
+        return;
+    }
+    for (int i = l->n - 1; i >= 0; i--) {
+        struct gut_placement *p = &l->v[i];
+        int end = p->row + p->rows;
+
+        if (p->row >= to || end <= from)
+            continue;
+        if (from <= p->row && to >= end) {
+            gut_images_remove(b, i);
+        } else if (from <= p->row) {
+            int k = to - p->row;
+
+            gut_images_dirty(b, p);
+            p->row += k;
+            p->rows -= k;
+            p->src_y += k * p->cell_h;
+        } else {
+            gut_images_dirty(b, p);
+            p->rows = from - p->row;
+        }
+    }
+}
+
+/* Move the placements inside rows top to bot by count lines, upward
+ * for a positive count, cutting what leaves the region. Placements
+ * are split at the region's edges first so a straddling one keeps the
+ * part outside where it is. */
+static void
+gut_images_scroll(struct gut_buf *b, int top, int bot, int count)
+{
+    struct gut_image_list *l = &b->images;
+
+    if (l->n == 0)
+        return;
+    if (gut_images_split(b, top) != 0 || gut_images_split(b, bot) != 0) {
+        gut_buf_cut_images(b, top, bot);
+        return;
+    }
+    if (count > 0)
+        gut_buf_cut_images(b, top, top + count);
+    else
+        gut_buf_cut_images(b, bot + count, bot);
+    for (int i = 0; i < l->n; i++) {
+        struct gut_placement *p = &l->v[i];
+
+        if (p->row >= top && p->row + p->rows <= bot)
+            p->row -= count;
+    }
+}
+
+int
+gut_buf_place_image(struct gut_buf *b, struct gut_image *img, int row,
+                    int col, int cell_w, int cell_h)
+{
+    struct gut_image_list *l = &b->images;
+    struct gut_image_ref *ref;
+    struct gut_placement *p;
+    size_t pixels = (size_t)img->w * (size_t)img->h;
+    size_t budget = b->image_budget ? b->image_budget : GUT_BUF_IMAGE_BUDGET;
+
+    if (img->w <= 0 || img->h <= 0 || !img->rgba || cell_w <= 0 ||
+        cell_h <= 0 || row < 0 || row >= b->rows || col < 0 ||
+        col >= b->cols || pixels > budget)
+        goto drop;
+    gut_images_evict(b, budget - pixels);
+    ref = malloc(sizeof(*ref));
+    if (!ref)
+        goto drop;
+    p = gut_images_append(b);
+    if (!p) {
+        free(ref);
+        goto drop;
+    }
+    if (b->image_next_id <= 0)      /* first use, or wrapped */
+        b->image_next_id = 1;
+    ref->id = b->image_next_id++;
+    ref->refs = 1;
+    ref->img = *img;
+    img->rgba = NULL;
+    img->w = 0;
+    img->h = 0;
+    l->pixels += pixels;
+    p->ref = ref;
+    p->row = row;
+    p->col = col;
+    p->rows = (ref->img.h + cell_h - 1) / cell_h;
+    p->cols = (ref->img.w + cell_w - 1) / cell_w;
+    p->cell_w = cell_w;
+    p->cell_h = cell_h;
+    p->src_y = 0;
+    p->seq = b->image_seq++;
+    if (row + p->rows > b->rows)
+        p->rows = b->rows - row;
+    gut_images_dirty(b, p);
+    return ref->id;
+drop:
+    gut_image_free(img);
+    return -1;
+}
+
+void
+gut_buf_set_image_budget(struct gut_buf *b, size_t pixels)
+{
+    b->image_budget = pixels;
+    gut_images_evict(b, pixels ? pixels : GUT_BUF_IMAGE_BUDGET);
+}
+
+const struct gut_placement *
+gut_buf_images(const struct gut_buf *b, int *n)
+{
+    *n = b->images.n;
+    return b->images.v;
+}
+
+void
+gut_image_list_free(struct gut_image_list *list)
+{
+    for (int i = 0; i < list->n; i++)
+        gut_image_ref_drop(list, list->v[i].ref);
+    free(list->v);
+    list->v = NULL;
+    list->n = 0;
+    list->cap = 0;
+    list->pixels = 0;
+}
+
+void
+gut_buf_drop_images(struct gut_buf *b)
+{
+    for (int i = 0; i < b->images.n; i++)
+        gut_images_dirty(b, &b->images.v[i]);
+    gut_image_list_free(&b->images);
+}
+
+void
+gut_buf_swap_images(struct gut_buf *b, struct gut_image_list *other)
+{
+    struct gut_image_list tmp = b->images;
+
+    for (int i = 0; i < b->images.n; i++)
+        gut_images_dirty(b, &b->images.v[i]);
+    b->images = *other;
+    *other = tmp;
+    /* the grid may have changed size while the list was parked */
+    for (int i = b->images.n - 1; i >= 0; i--) {
+        struct gut_placement *p = &b->images.v[i];
+
+        if (p->row >= b->rows)
+            gut_images_remove(b, i);
+        else if (p->row + p->rows > b->rows)
+            p->rows = b->rows - p->row;
+    }
+    gut_images_evict(b, b->image_budget ? b->image_budget
+                                      : GUT_BUF_IMAGE_BUDGET);
+    for (int i = 0; i < b->images.n; i++)
+        gut_images_dirty(b, &b->images.v[i]);
+}
+
 int
 gut_buf_init(struct gut_buf *b, int rows, int cols)
 {
@@ -1013,6 +1356,7 @@ gut_buf_init(struct gut_buf *b, int rows, int cols)
     b->rows = rows;
     b->cols = cols;
     b->cursor_visible = 1;
+    b->image_next_id = 1;
     gut_buf_clear(b, gut_color_default());
     return 0;
 }
@@ -1020,6 +1364,7 @@ gut_buf_init(struct gut_buf *b, int rows, int cols)
 void
 gut_buf_free(struct gut_buf *b)
 {
+    gut_image_list_free(&b->images);
     free(b->cells);
     free(b->dirty);
     b->cells = NULL;
@@ -1054,6 +1399,7 @@ gut_buf_resize(struct gut_buf *b, int rows, int cols)
         memcpy(&cells[r * cols], &b->cells[r * b->cols],
                (size_t)keep_cols * sizeof(*cells));
     memset(dirty, 1, (size_t)rows);
+    gut_image_list_free(&b->images);
     free(b->cells);
     free(b->dirty);
     b->cells = cells;
@@ -1091,6 +1437,7 @@ gut_buf_clear_rows(struct gut_buf *b, int from, int to, struct gut_color bg)
         from = 0;
     if (to > b->rows)
         to = b->rows;
+    gut_buf_cut_images(b, from, to);
     for (int r = from; r < to; r++) {
         for (int c = 0; c < b->cols; c++)
             gut_cell_erase(&b->cells[r * b->cols + c], bg);
@@ -1220,6 +1567,7 @@ gut_buf_scroll(struct gut_buf *b, int top, int bot, int count,
         gut_buf_clear_rows(b, top, bot, bg);
         return;
     }
+    gut_images_scroll(b, top, bot, count);
     if (count > 0) {
         memmove(&b->cells[top * b->cols], &b->cells[(top + count) * b->cols],
                 (size_t)(n - count) * (size_t)b->cols * sizeof(*b->cells));
@@ -3943,15 +4291,6 @@ gut_hls_to_rgb(int h, int l, int s)
     return ((uint32_t)(int)((rgb[0] + m) * 255.0 + 0.5) << 16) |
            ((uint32_t)(int)((rgb[1] + m) * 255.0 + 0.5) << 8) |
            (uint32_t)(int)((rgb[2] + m) * 255.0 + 0.5);
-}
-
-void
-gut_image_free(struct gut_image *img)
-{
-    free(img->rgba);
-    img->rgba = NULL;
-    img->w = 0;
-    img->h = 0;
 }
 
 void

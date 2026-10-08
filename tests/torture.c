@@ -54,6 +54,40 @@ static unsigned long iter;
 /* ---- invariants ---- */
 
 static void
+check_images(const struct gut_buf *b)
+{
+    const struct gut_image_list *l = &b->images;
+    size_t pixels = 0;
+
+    for (int i = 0; i < l->n; i++) {
+        const struct gut_placement *p = &l->v[i];
+        int counted = 0;
+
+        if (!p->ref || p->ref->refs < 1 || !p->ref->img.rgba)
+            FAIL("placement %d has a bad picture", i);
+        if (p->rows < 1 || p->row < 0 || p->row + p->rows > b->rows)
+            FAIL("placement %d rows %d+%d outside %d", i, p->row, p->rows,
+                 b->rows);
+        if (p->col < 0 || p->cell_w < 1 || p->cell_h < 1 ||
+            p->cols != (p->ref->img.w + p->cell_w - 1) / p->cell_w)
+            FAIL("placement %d columns", i);
+        if (p->src_y < 0 || p->src_y >= p->ref->img.h ||
+            p->src_y % p->cell_h != 0)
+            FAIL("placement %d src_y %d of %d", i, p->src_y, p->ref->img.h);
+        for (int j = 0; j < i; j++)
+            if (l->v[j].ref == p->ref)
+                counted = 1;
+        if (!counted)
+            pixels += (size_t)p->ref->img.w * (size_t)p->ref->img.h;
+    }
+    if (pixels != l->pixels)
+        FAIL("image pixels %lu accounted %lu", (unsigned long)pixels,
+             (unsigned long)l->pixels);
+    if (l->pixels > (b->image_budget ? b->image_budget : GUT_BUF_IMAGE_BUDGET))
+        FAIL("image pixels %lu over budget", (unsigned long)l->pixels);
+}
+
+static void
 check_buf(const struct gut_buf *b)
 {
     if (b->rows < 1 || b->cols < 1)
@@ -84,6 +118,7 @@ check_buf(const struct gut_buf *b)
                 FAIL("bad color type at %d,%d", r, c);
         }
     }
+    check_images(b);
 }
 
 static void
@@ -462,14 +497,16 @@ static void
 torture_buf(unsigned long iterations)
 {
     struct gut_buf b;
+    struct gut_image_list parked;
     char text[64];
 
+    memset(&parked, 0, sizeof(parked));
     gut_buf_init(&b, rnd_range(1, 30), rnd_range(1, 100));
     for (iter = 0; iter < iterations; iter++) {
         int r = rnd_range(-3, b.rows + 3), c = rnd_range(-3, b.cols + 3);
         uint16_t attrs = (uint16_t)rnd();
 
-        switch (rnd_range(0, 8)) {
+        switch (rnd_range(0, 11)) {
         case 0:
             gut_buf_put(&b, r, c, rnd() % 0x110000, rnd_color(),
                         rnd_color(), attrs);
@@ -509,12 +546,44 @@ torture_buf(unsigned long iterations)
             if (gut_buf_resize(&b, rnd_range(1, 30), rnd_range(1, 100)) != 0)
                 FAIL("buf resize failed");
             break;
+        case 9: {
+            struct gut_image img;
+
+            img.w = rnd_range(1, 40);
+            img.h = rnd_range(1, 40);
+            img.rgba = calloc((size_t)img.w * img.h, 4);
+            if (rnd_range(0, 19) == 0)
+                img.w = 0;
+            gut_buf_place_image(&b, &img, r, c, rnd_range(1, 16),
+                                rnd_range(1, 16));
+            if (img.rgba)
+                FAIL("place_image kept the pixels with the caller");
+            break;
+        }
+        case 10:
+            switch (rnd_range(0, 3)) {
+            case 0:
+                gut_buf_set_image_budget(&b, (size_t)rnd_range(0, 3000));
+                break;
+            case 1:
+                gut_buf_cut_images(&b, rnd_range(-3, b.rows + 3),
+                                   rnd_range(-3, b.rows + 3));
+                break;
+            case 2:
+                gut_buf_swap_images(&b, &parked);
+                break;
+            default:
+                gut_buf_drop_images(&b);
+                break;
+            }
+            break;
         default:
             gut_buf_dirty_all(&b);
             break;
         }
         check_buf(&b);
     }
+    gut_image_list_free(&parked);
     gut_buf_free(&b);
 }
 

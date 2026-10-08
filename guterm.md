@@ -277,6 +277,62 @@ to the buffer. `gut_buf_scroll` moves rows `top` to `bot` by `count`
 lines, upward for positive counts, and fills the exposed rows with blanks
 on background `bg`. A count at least as large as the region clears it.
 
+### Pictures
+
+```c
+int  gut_buf_place_image(struct gut_buf *b, struct gut_image *img,
+                         int row, int col, int cell_w, int cell_h);
+void gut_buf_set_image_budget(struct gut_buf *b, size_t pixels);
+const struct gut_placement *gut_buf_images(const struct gut_buf *b, int *n);
+void gut_buf_cut_images(struct gut_buf *b, int from, int to);
+void gut_buf_drop_images(struct gut_buf *b);
+void gut_buf_swap_images(struct gut_buf *b, struct gut_image_list *other);
+void gut_image_list_free(struct gut_image_list *list);
+```
+
+A buffer can pin pictures to its grid, for sixel graphics and anything
+else a host decodes. A `struct gut_image` is `w` by `h` pixels of RGBA,
+4 bytes each, row major, alpha 0 where nothing was painted.
+`gut_buf_place_image` pins one with its top left at cell `(row, col)`,
+each cell showing `cell_w` by `cell_h` of its pixels, and returns the
+picture's id, from 1, or -1 when it was not placed. The buffer takes
+the pixels either way and `img` is empty afterwards. Rows below the
+grid are cut off; columns past the right edge are kept and left for
+the renderer to clip.
+
+Placements follow the rows they sit on. `gut_buf_scroll` moves them
+with the region and cuts off what leaves it; a placement that straddles
+the region's edge is split there, so the part outside stays put.
+`gut_buf_clear_rows` and `gut_buf_clear` cut the rows cleared, which may
+leave the bands above and below as two placements sharing one
+picture. Text written over a placement does not disturb it: the cells
+are drawn over the picture. `gut_buf_resize` drops every placement.
+That is the documented behavior, not a gap: a resize changes the cell
+size and the layout, and the program that placed the picture is the
+one that knows whether and where to place it again.
+
+The pictures count toward a budget in pixels, `GUT_BUF_IMAGE_BUDGET`
+unless `gut_buf_set_image_budget` says otherwise. When a new picture
+needs room the oldest placements are discarded first, by placement
+time, so the two bands of a split picture go together. A picture
+larger than the whole budget is refused.
+
+`gut_buf_images` hands the placements to a renderer. Each
+`struct gut_placement` names its picture through `ref`, shared by the
+bands of a split, and the band of it to show: image rows from `src_y`
+for `rows * cell_h` pixels or to the bottom of the picture, drawn with
+its top left at `(row, col)`. `ref->id` is stable across splits and
+scrolls, so a renderer can cache one texture per picture. A host that
+draws the cells itself and does not want pictures can ignore the list;
+nothing in the cell API changes.
+
+`gut_buf_swap_images` exchanges the buffer's placements with a list
+held elsewhere, so an emulator can park the primary screen's pictures
+while the alternate screen is up. A parked list is outside the budget
+until it comes back, when it is clipped to the grid and the budget
+like any other placement. `gut_image_list_free` releases a parked
+list; a zeroed `struct gut_image_list` is an empty one.
+
 ### Copying cells to text
 
 ```c
@@ -1247,6 +1303,9 @@ Buffer, no dependencies: `gut_color_default`, `gut_color_indexed`,
 `gut_buf_free`, `gut_buf_resize`, `gut_buf_cell`, `gut_buf_clear`,
 `gut_buf_clear_rows`, `gut_buf_put`, `gut_buf_text`, `gut_buf_fill`,
 `gut_buf_scroll`, `gut_buf_dirty_all`, `gut_buf_copy_text`,
+`gut_buf_place_image`, `gut_buf_set_image_budget`, `gut_buf_images`,
+`gut_buf_cut_images`, `gut_buf_drop_images`, `gut_buf_swap_images`,
+`gut_image_list_free`, `gut_image_free`,
 `gut_utf8_decode`, `gut_utf8_encode`, `gut_rune_width`,
 `gut_font_default`, `gut_font_lookup`, `gut_encode_event`,
 `gut_sel_clear`, `gut_sel_begin`, `gut_sel_extend`, `gut_sel_mouse`,
@@ -1265,7 +1324,6 @@ VT, no dependencies: `gut_vt_init`, `gut_vt_free`, `gut_vt_reset`,
 `gut_vt_mouse`,
 `gut_vt_set_scrollback`, `gut_vt_scrollback_lines`, `gut_vt_set_image_limit`,
 `gut_sixel_begin`, `gut_sixel_put`, `gut_sixel_end`, `gut_sixel_abort`,
-`gut_image_free`,
 `gut_vt_clear_scrollback`, `gut_vt_set_view`, `gut_vt_scroll_view`,
 `gut_vt_view_offset`, `gut_vt_set_reply`, `gut_vt_set_title_cb`,
 `gut_vt_set_bell_cb`, `gut_vt_set_clipboard_cb`.
