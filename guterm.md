@@ -468,6 +468,15 @@ is set. A block cursor inverts the cell. The underline and bar shapes
 overlay it. When the window has lost focus the cursor becomes a hollow
 box regardless of shape.
 
+The buffer's pictures, section 4, are drawn under the cells: a cell with
+the default background shows the picture through it and a colored one
+covers it, so text written over a picture stays readable and an erase
+with a background color removes it from view. Each picture is one
+texture, uploaded the first time it is seen and released when no
+placement shows it any more. A picture is scaled from the cell size it
+was placed at to the window's, so at zoom 2 each of its pixels is a
+2 by 2 block, like the font's.
+
 `gut_present` also tells the platform where the cursor cell is, which an
 input method uses to place its candidate window. See section 10.
 

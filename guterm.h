@@ -2971,6 +2971,16 @@ struct gut_window {
     struct gut_vertex *verts;
     size_t nverts, cap;
 
+    /* one texture per picture on screen, kept while it stays there */
+    struct gut_texture {
+        int id;
+        const struct gut_image_ref *ref;    /* tells a reused id apart */
+        int w, h;
+        gut_GLuint tex;
+        int seen;
+    } *textures;
+    int ntextures, cap_textures;
+
     char *clip;                 /* last clipboard text handed out */
     char *primary;              /* last primary selection handed out */
     char *event_text;           /* data of the last TEXT or PASTE event */
@@ -3340,6 +3350,8 @@ gut_close(gut_window *w)
             GUT_GL(glDeleteTextures)(1, &w->tex);
         if (w->prog)
             GUT_GL(glDeleteProgram)(w->prog);
+        for (int i = 0; i < w->ntextures; i++)
+            GUT_GL(glDeleteTextures)(1, &w->textures[i].tex);
         SDL_GL_DestroyContext(w->ctx);
     }
     if (w->win)
@@ -3351,6 +3363,7 @@ gut_close(gut_window *w)
     free(w->event_text);
     free(w->preedit);
     free(w->verts);
+    free(w->textures);
     for (int i = 0; i < GUT_MAX_PADS; i++)
         if (w->pads[i])
             SDL_CloseGamepad(w->pads[i]);
@@ -3841,6 +3854,113 @@ gut_text_input_area(gut_window *w, const struct gut_buf *b)
     SDL_SetTextInputArea(w->win, &r, 0);
 }
 
+/* Draw the quads gathered so far with one texture, then start over. */
+static void
+gut_flush(gut_window *w, gut_GLuint tex)
+{
+    if (w->nverts == 0)
+        return;
+    GUT_GL(glBindTexture)(GUT_GL_TEXTURE_2D, tex);
+    GUT_GL(glBufferData)(GUT_GL_ARRAY_BUFFER,
+                         (gut_GLsizeiptr)(w->nverts * sizeof(*w->verts)),
+                         w->verts, GUT_GL_STREAM_DRAW);
+    GUT_GL(glDrawArrays)(GUT_GL_TRIANGLES, 0, (gut_GLsizei)w->nverts);
+    w->nverts = 0;
+}
+
+/* The texture holding a placement's picture, uploaded on first sight. */
+static struct gut_texture *
+gut_texture_for(gut_window *w, const struct gut_placement *p)
+{
+    const struct gut_image_ref *ref = p->ref;
+    struct gut_texture *t;
+
+    for (int i = 0; i < w->ntextures; i++) {
+        t = &w->textures[i];
+        if (t->id == ref->id && t->ref == ref && t->w == ref->img.w &&
+            t->h == ref->img.h) {
+            t->seen = 1;
+            return t;
+        }
+    }
+    if (w->ntextures == w->cap_textures) {
+        int cap = w->cap_textures ? w->cap_textures * 2 : 8;
+        struct gut_texture *v = realloc(w->textures,
+                                        (size_t)cap * sizeof(*v));
+
+        if (!v)
+            return NULL;
+        w->textures = v;
+        w->cap_textures = cap;
+    }
+    t = &w->textures[w->ntextures++];
+    t->id = ref->id;
+    t->ref = ref;
+    t->w = ref->img.w;
+    t->h = ref->img.h;
+    t->seen = 1;
+    GUT_GL(glGenTextures)(1, &t->tex);
+    GUT_GL(glBindTexture)(GUT_GL_TEXTURE_2D, t->tex);
+    GUT_GL(glTexImage2D)(GUT_GL_TEXTURE_2D, 0, GUT_GL_RGBA, t->w, t->h, 0,
+                         GUT_GL_RGBA, GUT_GL_UNSIGNED_BYTE, ref->img.rgba);
+    GUT_GL(glTexParameteri)(GUT_GL_TEXTURE_2D, GUT_GL_TEXTURE_MIN_FILTER,
+                            GUT_GL_NEAREST);
+    GUT_GL(glTexParameteri)(GUT_GL_TEXTURE_2D, GUT_GL_TEXTURE_MAG_FILTER,
+                            GUT_GL_NEAREST);
+    GUT_GL(glTexParameteri)(GUT_GL_TEXTURE_2D, GUT_GL_TEXTURE_WRAP_S,
+                            GUT_GL_CLAMP_TO_EDGE);
+    GUT_GL(glTexParameteri)(GUT_GL_TEXTURE_2D, GUT_GL_TEXTURE_WRAP_T,
+                            GUT_GL_CLAMP_TO_EDGE);
+    return t;
+}
+
+/* Let go of the textures no placement used this frame. */
+static void
+gut_textures_sweep(gut_window *w)
+{
+    for (int i = w->ntextures - 1; i >= 0; i--) {
+        struct gut_texture *t = &w->textures[i];
+
+        if (t->seen) {
+            t->seen = 0;
+            continue;
+        }
+        GUT_GL(glDeleteTextures)(1, &t->tex);
+        *t = w->textures[w->ntextures - 1];
+        w->ntextures--;
+    }
+}
+
+/* Each placement is one textured quad: the band of its picture from
+ * src_y, scaled from the cell size it was placed at to the window's,
+ * so a zoomed font zooms the picture with it. */
+static void
+gut_draw_images(gut_window *w, const struct gut_buf *b)
+{
+    int n;
+    const struct gut_placement *p = gut_buf_images(b, &n);
+
+    for (int i = 0; i < n; i++, p++) {
+        const struct gut_image *img = &p->ref->img;
+        struct gut_texture *t = gut_texture_for(w, p);
+        float sx = (float)w->cell_w / (float)p->cell_w;
+        float sy = (float)w->cell_h / (float)p->cell_h;
+        int band = p->rows * p->cell_h;
+
+        if (!t)
+            continue;
+        if (band > img->h - p->src_y)
+            band = img->h - p->src_y;
+        gut_quad(w, (float)(p->col * w->cell_w), (float)(p->row * w->cell_h),
+                 (float)img->w * sx, (float)band * sy,
+                 0.0f, (float)p->src_y / (float)img->h,
+                 1.0f, (float)(p->src_y + band) / (float)img->h,
+                 0xFFFFFF);
+        gut_flush(w, t->tex);
+    }
+    gut_textures_sweep(w);
+}
+
 void
 gut_present(gut_window *w, struct gut_buf *b)
 {
@@ -3849,6 +3969,33 @@ gut_present(gut_window *w, struct gut_buf *b)
 
     SDL_GL_MakeCurrent(w->win, w->ctx);
     w->nverts = 0;
+
+    GUT_GL(glViewport)(0, 0, w->px_w, w->px_h);
+    GUT_GL(glClearColor)(((w->def_bg >> 16) & 0xFF) / 255.0f,
+                         ((w->def_bg >> 8) & 0xFF) / 255.0f,
+                         (w->def_bg & 0xFF) / 255.0f, 1.0f);
+    GUT_GL(glClear)(GUT_GL_COLOR_BUFFER_BIT);
+    GUT_GL(glUseProgram)(w->prog);
+    GUT_GL(glUniform2f)(w->u_screen, (float)w->px_w, (float)w->px_h);
+    GUT_GL(glActiveTexture)(GUT_GL_TEXTURE0);
+    GUT_GL(glUniform1i)(w->u_tex, 0);
+    GUT_GL(glBindBuffer)(GUT_GL_ARRAY_BUFFER, w->vbo);
+    GUT_GL(glEnableVertexAttribArray)(0);
+    GUT_GL(glEnableVertexAttribArray)(1);
+    GUT_GL(glEnableVertexAttribArray)(2);
+    GUT_GL(glVertexAttribPointer)(0, 2, GUT_GL_FLOAT, GUT_GL_FALSE,
+                                  sizeof(struct gut_vertex),
+                                  (const void *)0);
+    GUT_GL(glVertexAttribPointer)(1, 2, GUT_GL_FLOAT, GUT_GL_FALSE,
+                                  sizeof(struct gut_vertex),
+                                  (const void *)(2 * sizeof(float)));
+    GUT_GL(glVertexAttribPointer)(2, 4, GUT_GL_UNSIGNED_BYTE, GUT_GL_TRUE,
+                                  sizeof(struct gut_vertex),
+                                  (const void *)(4 * sizeof(float)));
+
+    /* pictures lie under the cells: a cell with the default background
+     * shows the picture through, a colored one covers it */
+    gut_draw_images(w, b);
 
     /* backgrounds first so glyph overhang (bold shift) stays on top */
     for (int r = 0; r < rows; r++) {
@@ -3881,36 +4028,7 @@ gut_present(gut_window *w, struct gut_buf *b)
     }
     if (w->overlay && w->preedit && w->preedit[0])
         gut_draw_preedit(w, b);
-
-    GUT_GL(glViewport)(0, 0, w->px_w, w->px_h);
-    GUT_GL(glClearColor)(((w->def_bg >> 16) & 0xFF) / 255.0f,
-                         ((w->def_bg >> 8) & 0xFF) / 255.0f,
-                         (w->def_bg & 0xFF) / 255.0f, 1.0f);
-    GUT_GL(glClear)(GUT_GL_COLOR_BUFFER_BIT);
-    if (w->nverts > 0) {
-        GUT_GL(glUseProgram)(w->prog);
-        GUT_GL(glUniform2f)(w->u_screen, (float)w->px_w, (float)w->px_h);
-        GUT_GL(glActiveTexture)(GUT_GL_TEXTURE0);
-        GUT_GL(glBindTexture)(GUT_GL_TEXTURE_2D, w->tex);
-        GUT_GL(glUniform1i)(w->u_tex, 0);
-        GUT_GL(glBindBuffer)(GUT_GL_ARRAY_BUFFER, w->vbo);
-        GUT_GL(glBufferData)(GUT_GL_ARRAY_BUFFER,
-                             (gut_GLsizeiptr)(w->nverts * sizeof(*w->verts)),
-                             w->verts, GUT_GL_STREAM_DRAW);
-        GUT_GL(glEnableVertexAttribArray)(0);
-        GUT_GL(glEnableVertexAttribArray)(1);
-        GUT_GL(glEnableVertexAttribArray)(2);
-        GUT_GL(glVertexAttribPointer)(0, 2, GUT_GL_FLOAT, GUT_GL_FALSE,
-                                      sizeof(struct gut_vertex),
-                                      (const void *)0);
-        GUT_GL(glVertexAttribPointer)(1, 2, GUT_GL_FLOAT, GUT_GL_FALSE,
-                                      sizeof(struct gut_vertex),
-                                      (const void *)(2 * sizeof(float)));
-        GUT_GL(glVertexAttribPointer)(2, 4, GUT_GL_UNSIGNED_BYTE, GUT_GL_TRUE,
-                                      sizeof(struct gut_vertex),
-                                      (const void *)(4 * sizeof(float)));
-        GUT_GL(glDrawArrays)(GUT_GL_TRIANGLES, 0, (gut_GLsizei)w->nverts);
-    }
+    gut_flush(w, w->tex);
     SDL_GL_SwapWindow(w->win);
     memset(b->dirty, 0, (size_t)b->rows);
     gut_text_input_area(w, b);
