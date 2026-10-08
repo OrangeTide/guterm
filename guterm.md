@@ -331,8 +331,12 @@ elements and geometric shapes. It has no CJK glyphs; wide characters take
 two cells but draw as the fallback glyph.
 
 A codepoint the font lacks is drawn as U+FFFD if the font has it, else as
-`?`. Glyphs are drawn at an integer zoom, so an 8 by 16 font at scale 2
-gives 16 by 32 pixel cells.
+`?`. Glyphs are drawn at an integer zoom, `gut_desc.scale`, so an 8 by 16
+font at scale 2 gives 16 by 32 pixel cells. A scale of 0 picks 1 on an
+ordinary display and the rounded content scale that SDL reports on a
+high density display, 2 on a typical 200 percent desktop, so text comes
+out about the same physical size everywhere. Resizing the window changes
+the grid, never the zoom.
 
 To supply a font, fill a `struct gut_font` with static tables and pass
 its address in `gut_desc.font`. The tables must outlive the window.
@@ -348,7 +352,9 @@ fonts or more than one font per window.
 struct gut_desc {
     const char *title;
     int cols, rows;                 /* initial grid, default 80 x 25 */
-    int scale;                      /* integer pixel zoom, default 2 */
+    int scale;                      /* integer pixel zoom; 0 picks 1, or
+                                       the display content scale on a
+                                       high density display */
     const struct gut_font *font;    /* NULL for the built-in 8x16 */
     uint32_t fg, bg;                /* 0xRRGGBB defaults; 0 means unset */
     const uint32_t *palette;        /* 16 ANSI colors 0xRRGGBB or NULL */

@@ -417,7 +417,9 @@ GUT_API size_t gut_sel_text(const struct gut_sel *s, const struct gut_buf *b,
 struct gut_desc {
     const char *title;
     int cols, rows;                 /* initial grid, default 80 x 25 */
-    int scale;                      /* integer pixel zoom, default 2 */
+    int scale;                      /* integer pixel zoom; 0 picks 1, or
+                                       the display content scale on a
+                                       high density display */
     const struct gut_font *font;    /* NULL for the built-in 8x16 */
     uint32_t fg, bg;                /* 0xRRGGBB defaults; 0 means unset */
     const uint32_t *palette;        /* 16 ANSI colors 0xRRGGBB or NULL */
@@ -2752,9 +2754,6 @@ gut_open(const struct gut_desc *desc)
         return NULL;
     }
     w->font = d.font ? d.font : gut_font_default();
-    w->scale = d.scale > 0 ? d.scale : 2;
-    w->cell_w = w->font->glyph_w * w->scale;
-    w->cell_h = w->font->glyph_h * w->scale;
     cols = d.cols > 0 ? d.cols : 80;
     rows = d.rows > 0 ? d.rows : 25;
     gut_set_palette(w, d.palette);
@@ -2775,6 +2774,18 @@ gut_open(const struct gut_desc *desc)
     if (!d.no_gamepad && !SDL_WasInit(SDL_INIT_GAMEPAD) &&
         SDL_InitSubSystem(SDL_INIT_GAMEPAD))
         w->owns_gamepad = 1;    /* failure just means no pads */
+    /* Zoom: as asked, else 1 on an ordinary display and the rounded
+     * content scale on a high density one, so text is about the same
+     * physical size everywhere. */
+    if (d.scale > 0) {
+        w->scale = d.scale;
+    } else {
+        float cs = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
+
+        w->scale = cs >= 1.5f ? (int)(cs + 0.5f) : 1;
+    }
+    w->cell_w = w->font->glyph_w * w->scale;
+    w->cell_h = w->font->glyph_h * w->scale;
     if (gut_create_context(w, d.title ? d.title : "guterm",
                            cols * w->cell_w, rows * w->cell_h,
                            d.fixed_size) != 0 ||

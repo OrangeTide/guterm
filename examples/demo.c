@@ -108,7 +108,7 @@ main(int argc, char **argv)
     desc.title = "guterm demo";
     desc.cols = 100;
     desc.rows = 30;
-    desc.scale = argc > 1 ? atoi(argv[1]) : 2;
+    desc.scale = argc > 1 ? atoi(argv[1]) : 0;   /* 0: from the display */
 
     w = gut_open(&desc);
     if (!w) {
