@@ -16,6 +16,7 @@
 #define GUTERM_NO_WINDOW
 #include "guterm.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -111,11 +112,40 @@ check_vt(const struct gut_vt *vt)
         FAIL("charset %d", vt->charset);
     if (vt->saved.row < 0 || vt->saved.col < 0)
         FAIL("saved cursor %d,%d", vt->saved.row, vt->saved.col);
+    if (vt->sb_len < 0 || vt->sb_len > vt->sb_cap)
+        FAIL("scrollback holds %d of %d", vt->sb_len, vt->sb_cap);
+    if (vt->view < 0 || vt->view > vt->sb_len)
+        FAIL("view %d with %d lines", vt->view, vt->sb_len);
+    if (vt->view > 0 && (vt->modes & GUT_VT_MODE_ALTSCREEN))
+        FAIL("view %d on the alternate screen", vt->view);
+    if (vt->view > 0 && (vt->buf != &vt->live || vt->out == vt->buf))
+        FAIL("view %d but the emulator writes to the caller", vt->view);
+    if (vt->view == 0 && vt->buf != vt->out)
+        FAIL("live but the emulator writes elsewhere");
+    if (vt->view > 0) {
+        check_buf(vt->out);
+        if (vt->out->rows != b->rows || vt->out->cols != b->cols)
+            FAIL("view %dx%d differs from screen %dx%d", vt->out->rows,
+                 vt->out->cols, b->rows, b->cols);
+        if (vt->out->cursor_visible)
+            FAIL("cursor shown while scrolled back");
+    }
+    for (int i = 0; i < vt->sb_len; i++) {
+        const struct gut_vt_line *line =
+            &vt->sb[(vt->sb_head + i) % vt->sb_cap];
+
+        if (line->n < 0 || (line->n > 0 && !line->cells))
+            FAIL("scrollback line %d has %d cells", i, line->n);
+        for (int c = 0; c < line->n; c++)
+            if (line->cells[c].width > 2)
+                FAIL("scrollback line %d cell %d width %d", i, c,
+                     line->cells[c].width);
+    }
 }
 
 /* ---- input generators ---- */
 
-static const char csi_finals[] = "ABCDEFGHJKLMPSTXZ@cdfghlmnrsuq`";
+static const char csi_finals[] = "ABCDEFGHJJJKLMPSTXZ@cdfghlmnrsuq`";
 static const char esc_finals[] = "78DEHM=>c()B0";
 
 static size_t
@@ -291,6 +321,35 @@ torture_vt(unsigned long iterations)
         if (rnd_range(0, 19) == 0) {
             if (gut_vt_resize(&vt, rnd_range(1, 40), rnd_range(1, 120)) != 0)
                 FAIL("resize failed");
+            check_vt(&vt);
+        }
+        if (rnd_range(0, 7) == 0) {
+            int off;
+
+            switch (rnd_range(0, 3)) {
+            case 0: off = gut_vt_set_view(&vt, 0); break;
+            case 1: off = gut_vt_set_view(&vt, rnd_range(-5, 2000)); break;
+            case 2: off = gut_vt_scroll_view(&vt, rnd_range(-50, 50)); break;
+            default: off = gut_vt_scroll_view(&vt, rnd_range(0, 1)
+                                              ? INT_MAX : INT_MIN); break;
+            }
+            if (off != gut_vt_view_offset(&vt))
+                FAIL("view offset %d reported %d", off,
+                     gut_vt_view_offset(&vt));
+            check_vt(&vt);
+        }
+        if (rnd_range(0, 99) == 0) {
+            if (gut_vt_set_scrollback(&vt, rnd_range(0, 3) == 0
+                                      ? 0 : rnd_range(1, 200)) != 0)
+                FAIL("set_scrollback failed");
+            check_vt(&vt);
+        }
+        if (rnd_range(0, 199) == 0) {
+            gut_vt_clear_scrollback(&vt);
+            if (gut_vt_scrollback_lines(&vt) != 0 ||
+                gut_vt_view_offset(&vt) != 0)
+                FAIL("clear_scrollback left %d lines, view %d",
+                     gut_vt_scrollback_lines(&vt), gut_vt_view_offset(&vt));
             check_vt(&vt);
         }
         if (rnd_range(0, 499) == 0) {

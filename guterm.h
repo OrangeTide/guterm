@@ -402,6 +402,7 @@ GUT_API const char *gut_error(void);
 
 #define GUT_VT_MAX_PARAMS 16
 #define GUT_VT_OSC_MAX    1024
+#define GUT_VT_SCROLLBACK_DEFAULT 1000
 
 struct gut_vt_saved {
     int row, col;
@@ -409,8 +410,15 @@ struct gut_vt_saved {
     struct gut_color fg, bg;
 };
 
+/* One scrollback line: the cells up to the last non-blank one. */
+struct gut_vt_line {
+    struct gut_cell *cells;
+    int n;
+};
+
 struct gut_vt {
-    struct gut_buf *buf;
+    struct gut_buf *buf;        /* where the emulator writes */
+    struct gut_buf *out;        /* the caller's buffer */
 
     /* emulation state */
     int row, col;               /* cursor */
@@ -429,6 +437,15 @@ struct gut_vt {
     struct gut_cell *alt_saved;
     int alt_rows, alt_cols;
     struct gut_vt_saved alt_cursor;
+
+    /* scrollback: a ring of lines that left the top of the primary
+     * screen, oldest at sb_head */
+    struct gut_vt_line *sb;
+    int sb_cap;                 /* ring capacity, 0 disables */
+    int sb_head;
+    int sb_len;
+    int view;                   /* lines scrolled back into view */
+    struct gut_buf live;        /* the screen while view > 0 */
 
     /* parser */
     int state;
@@ -469,6 +486,30 @@ GUT_API unsigned gut_vt_modes(const struct gut_vt *vt);
 
 /** gut_encode_event() flags matching the current modes. */
 GUT_API int gut_vt_encode_flags(const struct gut_vt *vt);
+
+/** Set how many lines the scrollback keeps, 0 to disable. The newest
+ * lines survive a shrink. Returns 0 or -1. */
+GUT_API int gut_vt_set_scrollback(struct gut_vt *vt, int lines);
+
+/** Lines currently held in the scrollback. */
+GUT_API int gut_vt_scrollback_lines(const struct gut_vt *vt);
+
+/** Discard the scrollback, as ED 3 does. */
+GUT_API void gut_vt_clear_scrollback(struct gut_vt *vt);
+
+/** Show the screen scrolled back by offset lines, 0 for the live screen.
+ * The offset is clamped to what the scrollback holds and to 0 on the
+ * alternate screen. Returns the offset in effect. While scrolled back
+ * the caller's buffer shows scrollback lines above the top of the live
+ * screen with the cursor hidden, and output keeps arriving behind the
+ * view, which stays on the same lines until it is moved. */
+GUT_API int gut_vt_set_view(struct gut_vt *vt, int offset);
+
+/** Move the view by delta lines, positive is further back. Returns the
+ * offset in effect. */
+GUT_API int gut_vt_scroll_view(struct gut_vt *vt, int delta);
+
+GUT_API int gut_vt_view_offset(const struct gut_vt *vt);
 
 /** Receiver for answers the program expects, such as DSR and DA. */
 GUT_API void gut_vt_set_reply(struct gut_vt *vt,
@@ -3096,11 +3137,172 @@ gut_vt_set_row(struct gut_vt *vt, int n)
     }
 }
 
+/* ---- scrollback ---- */
+
+static struct gut_vt_line *
+gut_vt_sb_line(const struct gut_vt *vt, int i)
+{
+    return &vt->sb[(vt->sb_head + i) % vt->sb_cap];
+}
+
+/* Store a copy of a row, trimmed of trailing default blanks. */
+static void
+gut_vt_sb_push(struct gut_vt *vt, const struct gut_cell *row, int cols)
+{
+    struct gut_vt_line *line;
+    struct gut_cell blank;
+    int n = cols;
+
+    if (vt->sb_cap == 0)
+        return;
+    gut_cell_erase(&blank, gut_color_default());
+    while (n > 0 && memcmp(&row[n - 1], &blank, sizeof(blank)) == 0)
+        n--;
+    if (vt->sb_len == vt->sb_cap) {
+        line = gut_vt_sb_line(vt, 0);
+        free(line->cells);
+        vt->sb_head = (vt->sb_head + 1) % vt->sb_cap;
+    } else {
+        line = gut_vt_sb_line(vt, vt->sb_len);
+        vt->sb_len++;
+    }
+    line->cells = NULL;
+    line->n = 0;
+    if (n > 0) {
+        line->cells = malloc((size_t)n * sizeof(*line->cells));
+        if (line->cells) {
+            memcpy(line->cells, row, (size_t)n * sizeof(*line->cells));
+            line->n = n;
+        }
+    }
+    /* keep a scrolled back view on the same lines */
+    if (vt->view > 0 && vt->view < vt->sb_len)
+        vt->view++;
+}
+
+/* Copy a scrollback line into a row of b, clipped or padded to width. */
+static void
+gut_vt_sb_unpack(const struct gut_vt *vt, int i, struct gut_buf *b, int row)
+{
+    const struct gut_vt_line *line = gut_vt_sb_line(vt, i);
+    struct gut_cell *dst = &b->cells[row * b->cols];
+    int n = line->n < b->cols ? line->n : b->cols;
+
+    if (n > 0)
+        memcpy(dst, line->cells, (size_t)n * sizeof(*dst));
+    for (int c = n; c < b->cols; c++)
+        gut_cell_erase(&dst[c], gut_color_default());
+    gut_buf_repair_row(b, row);
+    b->dirty[row] = 1;
+}
+
+/* Remove the newest line, after it was unpacked. */
+static void
+gut_vt_sb_drop_newest(struct gut_vt *vt)
+{
+    struct gut_vt_line *line = gut_vt_sb_line(vt, vt->sb_len - 1);
+
+    free(line->cells);
+    line->cells = NULL;
+    line->n = 0;
+    vt->sb_len--;
+}
+
+static void
+gut_vt_sb_free_lines(struct gut_vt *vt)
+{
+    for (int i = 0; i < vt->sb_len; i++)
+        free(gut_vt_sb_line(vt, i)->cells);
+    vt->sb_len = 0;
+    vt->sb_head = 0;
+}
+
+/* Fill the caller's buffer with the view: scrollback lines on top, the
+ * live screen below. */
+static void
+gut_vt_compose(struct gut_vt *vt)
+{
+    struct gut_buf *out = vt->out;
+    const struct gut_buf *live = &vt->live;
+
+    if (vt->view == 0)
+        return;
+    for (int r = 0; r < out->rows; r++) {
+        if (r < vt->view) {
+            gut_vt_sb_unpack(vt, vt->sb_len - vt->view + r, out, r);
+        } else {
+            memcpy(&out->cells[r * out->cols],
+                   &live->cells[(r - vt->view) * live->cols],
+                   (size_t)out->cols * sizeof(*out->cells));
+            out->dirty[r] = 1;
+        }
+    }
+    out->cursor_visible = 0;
+    out->cursor_row = 0;
+    out->cursor_col = 0;
+}
+
+static int
+gut_vt_view_apply(struct gut_vt *vt, int offset)
+{
+    struct gut_buf *out = vt->out;
+    size_t bytes;
+
+    if (offset > vt->sb_len)
+        offset = vt->sb_len;
+    if (offset < 0 || (vt->modes & GUT_VT_MODE_ALTSCREEN))
+        offset = 0;
+    if (offset == vt->view)
+        return vt->view;
+    bytes = (size_t)out->rows * (size_t)out->cols * sizeof(*out->cells);
+    if (vt->view == 0) {
+        /* park the live screen so the emulator keeps writing to it */
+        if (gut_buf_init(&vt->live, out->rows, out->cols) != 0)
+            return 0;
+        memcpy(vt->live.cells, out->cells, bytes);
+        vt->live.cursor_row = out->cursor_row;
+        vt->live.cursor_col = out->cursor_col;
+        vt->live.cursor_visible = out->cursor_visible;
+        vt->live.cursor_shape = out->cursor_shape;
+        vt->buf = &vt->live;
+    }
+    vt->view = offset;
+    if (offset == 0) {
+        memcpy(out->cells, vt->live.cells, bytes);
+        out->cursor_row = vt->live.cursor_row;
+        out->cursor_col = vt->live.cursor_col;
+        out->cursor_visible = vt->live.cursor_visible;
+        out->cursor_shape = vt->live.cursor_shape;
+        gut_buf_dirty_all(out);
+        gut_buf_free(&vt->live);
+        vt->buf = out;
+    } else {
+        gut_vt_compose(vt);
+    }
+    return vt->view;
+}
+
+/* Scroll the region up, feeding the scrollback when the top of the
+ * primary screen leaves. */
+static void
+gut_vt_scroll_up(struct gut_vt *vt, int count)
+{
+    struct gut_buf *b = vt->buf;
+
+    if (vt->scroll_top == 0 && !(vt->modes & GUT_VT_MODE_ALTSCREEN)) {
+        int n = count < vt->scroll_bot ? count : vt->scroll_bot;
+
+        for (int r = 0; r < n; r++)
+            gut_vt_sb_push(vt, &b->cells[r * b->cols], b->cols);
+    }
+    gut_buf_scroll(b, vt->scroll_top, vt->scroll_bot, count, vt->bg);
+}
+
 static void
 gut_vt_index(struct gut_vt *vt)
 {
     if (vt->row == vt->scroll_bot - 1)
-        gut_buf_scroll(vt->buf, vt->scroll_top, vt->scroll_bot, 1, vt->bg);
+        gut_vt_scroll_up(vt, 1);
     else if (vt->row < vt->buf->rows - 1)
         vt->row++;
 }
@@ -3138,11 +3340,14 @@ gut_vt_restore_cursor(struct gut_vt *vt)
 static void
 gut_vt_altscreen_enter(struct gut_vt *vt)
 {
-    struct gut_buf *b = vt->buf;
-    size_t n = (size_t)b->rows * (size_t)b->cols;
+    struct gut_buf *b;
+    size_t n;
 
     if (vt->modes & GUT_VT_MODE_ALTSCREEN)
         return;
+    gut_vt_view_apply(vt, 0);
+    b = vt->buf;
+    n = (size_t)b->rows * (size_t)b->cols;
     free(vt->alt_saved);
     vt->alt_saved = malloc(n * sizeof(*vt->alt_saved));
     if (vt->alt_saved) {
@@ -3379,8 +3584,11 @@ gut_vt_erase_display(struct gut_vt *vt, int mode)
         gut_vt_erase_cols(vt, vt->row, 0, vt->col + 1);
         break;
     case 2:
-    case 3:
         gut_buf_clear_rows(b, 0, b->rows, vt->bg);
+        break;
+    case 3:
+        if (!(vt->modes & GUT_VT_MODE_ALTSCREEN))
+            gut_vt_clear_scrollback(vt);
         break;
     }
 }
@@ -3564,8 +3772,7 @@ gut_vt_csi(struct gut_vt *vt, int final)
         gut_vt_delete_chars(vt, gut_vt_param(vt, 0, 1));
         break;
     case 'S':
-        gut_buf_scroll(b, vt->scroll_top, vt->scroll_bot,
-                       gut_vt_param(vt, 0, 1), vt->bg);
+        gut_vt_scroll_up(vt, gut_vt_param(vt, 0, 1));
         break;
     case 'T':
         gut_buf_scroll(b, vt->scroll_top, vt->scroll_bot,
@@ -3899,6 +4106,7 @@ gut_vt_feed(struct gut_vt *vt, const char *data, size_t len)
         gut_vt_byte(vt, (unsigned char)data[i]);
     vt->buf->cursor_row = vt->row;
     vt->buf->cursor_col = vt->col;
+    gut_vt_compose(vt);
 }
 
 /* ---- lifecycle ---- */
@@ -3906,10 +4114,13 @@ gut_vt_feed(struct gut_vt *vt, const char *data, size_t len)
 void
 gut_vt_reset(struct gut_vt *vt)
 {
-    struct gut_buf *b = vt->buf;
+    struct gut_buf *b;
 
     if (vt->modes & GUT_VT_MODE_ALTSCREEN)
         gut_vt_altscreen_leave(vt);
+    gut_vt_view_apply(vt, 0);
+    gut_vt_sb_free_lines(vt);
+    b = vt->buf;
     vt->modes = GUT_VT_MODE_AUTOWRAP;
     vt->mouse_mode = 0;
     vt->attrs = 0;
@@ -3941,9 +4152,15 @@ gut_vt_init(struct gut_vt *vt, struct gut_buf *buf)
 {
     memset(vt, 0, sizeof(*vt));
     vt->buf = buf;
+    vt->out = buf;
     vt->tabstops = calloc((size_t)buf->cols, 1);
     if (!vt->tabstops)
         return -1;
+    if (gut_vt_set_scrollback(vt, GUT_VT_SCROLLBACK_DEFAULT) != 0) {
+        free(vt->tabstops);
+        vt->tabstops = NULL;
+        return -1;
+    }
     gut_vt_reset(vt);
     return 0;
 }
@@ -3951,25 +4168,78 @@ gut_vt_init(struct gut_vt *vt, struct gut_buf *buf)
 void
 gut_vt_free(struct gut_vt *vt)
 {
+    gut_vt_sb_free_lines(vt);
+    free(vt->sb);
+    if (vt->view > 0)
+        gut_buf_free(&vt->live);
     free(vt->tabstops);
     free(vt->alt_saved);
+    vt->sb = NULL;
+    vt->sb_cap = 0;
+    vt->view = 0;
+    vt->buf = vt->out;
     vt->tabstops = NULL;
     vt->alt_saved = NULL;
+}
+
+/* Lines above the cursor move into the scrollback when the screen
+ * shrinks below it, and come back when it grows. */
+static void
+gut_vt_resize_shrink(struct gut_vt *vt, int rows)
+{
+    struct gut_buf *b = vt->buf;
+    int excess = vt->row - (rows - 1);
+
+    if (excess <= 0 || (vt->modes & GUT_VT_MODE_ALTSCREEN))
+        return;
+    for (int r = 0; r < excess; r++)
+        gut_vt_sb_push(vt, &b->cells[r * b->cols], b->cols);
+    gut_buf_scroll(b, 0, b->rows, excess, gut_color_default());
+    vt->row -= excess;
+    vt->saved.row -= excess;
+    if (vt->saved.row < 0)
+        vt->saved.row = 0;
+}
+
+static void
+gut_vt_resize_grow(struct gut_vt *vt, int old_rows)
+{
+    struct gut_buf *b = vt->buf;
+    int pull = b->rows - old_rows;
+
+    if (pull > vt->sb_len)
+        pull = vt->sb_len;
+    if (pull <= 0 || (vt->modes & GUT_VT_MODE_ALTSCREEN))
+        return;
+    gut_buf_scroll(b, 0, b->rows, -pull, gut_color_default());
+    for (int r = pull - 1; r >= 0; r--) {
+        gut_vt_sb_unpack(vt, vt->sb_len - 1, b, r);
+        gut_vt_sb_drop_newest(vt);
+    }
+    vt->row += pull;
+    vt->saved.row += pull;
 }
 
 int
 gut_vt_resize(struct gut_vt *vt, int rows, int cols)
 {
     uint8_t *tabs;
-    int old_cols = vt->buf->cols;
-    int full_region = vt->scroll_top == 0 &&
-                      vt->scroll_bot == vt->buf->rows;
+    int view = vt->view;
+    int old_rows, old_cols;
+    int full_region;
 
-    if (rows == vt->buf->rows && cols == old_cols)
+    if (rows < 1 || cols < 1)
+        return -1;
+    if (rows == vt->out->rows && cols == vt->out->cols)
         return 0;
     tabs = calloc((size_t)cols, 1);
     if (!tabs)
         return -1;
+    gut_vt_view_apply(vt, 0);
+    old_rows = vt->buf->rows;
+    old_cols = vt->buf->cols;
+    full_region = vt->scroll_top == 0 && vt->scroll_bot == old_rows;
+    gut_vt_resize_shrink(vt, rows);
     if (gut_buf_resize(vt->buf, rows, cols) != 0) {
         free(tabs);
         return -1;
@@ -3982,12 +4252,81 @@ gut_vt_resize(struct gut_vt *vt, int rows, int cols)
         vt->scroll_top = 0;
         vt->scroll_bot = rows;
     }
+    gut_vt_resize_grow(vt, old_rows);
     gut_vt_clamp(vt);
     if (vt->saved.row >= rows)
         vt->saved.row = rows - 1;
     if (vt->saved.col >= cols)
         vt->saved.col = cols - 1;
+    vt->buf->cursor_row = vt->row;
+    vt->buf->cursor_col = vt->col;
+    gut_vt_view_apply(vt, view);
     return 0;
+}
+
+int
+gut_vt_set_scrollback(struct gut_vt *vt, int lines)
+{
+    struct gut_vt_line *ring = NULL;
+    int keep;
+
+    if (lines < 0)
+        return -1;
+    if (lines > 0) {
+        ring = calloc((size_t)lines, sizeof(*ring));
+        if (!ring)
+            return -1;
+    }
+    keep = vt->sb_len < lines ? vt->sb_len : lines;
+    for (int i = 0; i < vt->sb_len - keep; i++)
+        free(gut_vt_sb_line(vt, i)->cells);
+    for (int i = 0; i < keep; i++)
+        ring[i] = *gut_vt_sb_line(vt, vt->sb_len - keep + i);
+    free(vt->sb);
+    vt->sb = ring;
+    vt->sb_cap = lines;
+    vt->sb_head = 0;
+    vt->sb_len = keep;
+    if (vt->view > keep)
+        gut_vt_view_apply(vt, keep);
+    return 0;
+}
+
+int
+gut_vt_scrollback_lines(const struct gut_vt *vt)
+{
+    return vt->sb_len;
+}
+
+void
+gut_vt_clear_scrollback(struct gut_vt *vt)
+{
+    gut_vt_view_apply(vt, 0);
+    gut_vt_sb_free_lines(vt);
+}
+
+int
+gut_vt_set_view(struct gut_vt *vt, int offset)
+{
+    return gut_vt_view_apply(vt, offset);
+}
+
+int
+gut_vt_scroll_view(struct gut_vt *vt, int delta)
+{
+    long offset = (long)vt->view + delta;
+
+    if (offset > vt->sb_len)
+        offset = vt->sb_len;
+    if (offset < 0)
+        offset = 0;
+    return gut_vt_view_apply(vt, (int)offset);
+}
+
+int
+gut_vt_view_offset(const struct gut_vt *vt)
+{
+    return vt->view;
 }
 
 unsigned

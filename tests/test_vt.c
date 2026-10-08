@@ -405,6 +405,103 @@ test_vt(void)
     gut_buf_free(&b);
 }
 
+static void
+test_scrollback(void)
+{
+    struct gut_buf b;
+    struct gut_vt vt;
+
+    CHECK(gut_buf_init(&b, 3, 8) == 0);
+    CHECK(gut_vt_init(&vt, &b) == 0);
+    CHECK(gut_vt_scrollback_lines(&vt) == 0);
+    CHECK(gut_vt_set_scrollback(&vt, 4) == 0);
+
+    /* six lines through a three row screen: three fall off the top */
+    feed(&vt, "l1\r\nl2\r\nl3\r\nl4\r\nl5\r\nl6");
+    CHECK(gut_vt_scrollback_lines(&vt) == 3);
+    CHECK(strcmp(row_text(&b, 0), "l4") == 0);
+    CHECK(strcmp(row_text(&b, 2), "l6") == 0);
+    CHECK(gut_vt_view_offset(&vt) == 0);
+
+    /* scroll back one line: l3 on top, cursor hidden */
+    CHECK(gut_vt_set_view(&vt, 1) == 1);
+    CHECK(strcmp(row_text(&b, 0), "l3") == 0);
+    CHECK(strcmp(row_text(&b, 1), "l4") == 0);
+    CHECK(strcmp(row_text(&b, 2), "l5") == 0);
+    CHECK(b.cursor_visible == 0);
+    CHECK(b.dirty[0] && b.dirty[2]);
+
+    /* output behind the view keeps the view on the same lines */
+    feed(&vt, "\r\nl7");
+    CHECK(gut_vt_view_offset(&vt) == 2);
+    CHECK(gut_vt_scrollback_lines(&vt) == 4);
+    CHECK(strcmp(row_text(&b, 0), "l3") == 0);
+    CHECK(strcmp(row_text(&b, 2), "l5") == 0);
+
+    /* clamped, and back to live shows the new output and cursor */
+    CHECK(gut_vt_scroll_view(&vt, 100) == 4);
+    CHECK(strcmp(row_text(&b, 0), "l1") == 0);
+    CHECK(gut_vt_scroll_view(&vt, -100) == 0);
+    CHECK(strcmp(row_text(&b, 0), "l5") == 0);
+    CHECK(strcmp(row_text(&b, 2), "l7") == 0);
+    CHECK(b.cursor_visible == 1);
+    CHECK(b.cursor_row == 2 && b.cursor_col == 2);
+
+    /* the ring drops the oldest line, l1 */
+    feed(&vt, "\r\nl8");
+    CHECK(gut_vt_scrollback_lines(&vt) == 4);
+    gut_vt_set_view(&vt, 4);
+    CHECK(strcmp(row_text(&b, 0), "l2") == 0);
+    gut_vt_set_view(&vt, 0);
+
+    /* the alternate screen neither feeds nor shows the scrollback */
+    feed(&vt, "\033[?1049h");
+    CHECK(gut_vt_set_view(&vt, 2) == 0);
+    feed(&vt, "a\r\nb\r\nc\r\nd\r\ne");
+    CHECK(gut_vt_scrollback_lines(&vt) == 4);
+    feed(&vt, "\033[?1049l");
+    CHECK(strcmp(row_text(&b, 2), "l8") == 0);
+
+    /* growing the screen pulls lines back, shrinking pushes them */
+    CHECK(gut_vt_resize(&vt, 5, 8) == 0);
+    CHECK(gut_vt_scrollback_lines(&vt) == 2);
+    CHECK(strcmp(row_text(&b, 0), "l4") == 0);
+    CHECK(strcmp(row_text(&b, 4), "l8") == 0);
+    CHECK(b.cursor_row == 4);
+    CHECK(gut_vt_resize(&vt, 2, 8) == 0);
+    CHECK(gut_vt_scrollback_lines(&vt) == 4);
+    CHECK(strcmp(row_text(&b, 0), "l7") == 0);
+    CHECK(strcmp(row_text(&b, 1), "l8") == 0);
+    CHECK(b.cursor_row == 1);
+
+    /* a narrower screen clips stored lines on the way back */
+    CHECK(gut_vt_resize(&vt, 3, 1) == 0);
+    CHECK(cp_at(&b, 0, 0) == 'l');
+    CHECK(gut_vt_resize(&vt, 3, 8) == 0);
+
+    /* shrinking the ring keeps the newest lines */
+    CHECK(gut_vt_set_view(&vt, 3) == 3);
+    CHECK(gut_vt_set_scrollback(&vt, 1) == 0);
+    CHECK(gut_vt_scrollback_lines(&vt) == 1);
+    CHECK(gut_vt_view_offset(&vt) == 1);
+    CHECK(gut_vt_set_scrollback(&vt, 0) == 0);
+    CHECK(gut_vt_view_offset(&vt) == 0);
+    CHECK(gut_vt_set_scrollback(&vt, -1) == -1);
+    feed(&vt, "\r\n\r\n\r\n");
+    CHECK(gut_vt_scrollback_lines(&vt) == 0);
+
+    /* ED 3 clears the scrollback and nothing else */
+    CHECK(gut_vt_set_scrollback(&vt, 10) == 0);
+    feed(&vt, "\033[2J\033[Hx\r\n\r\n\r\n\r\ny");
+    CHECK(gut_vt_scrollback_lines(&vt) == 2);
+    feed(&vt, "\033[3J");
+    CHECK(gut_vt_scrollback_lines(&vt) == 0);
+    CHECK(strcmp(row_text(&b, 2), "y") == 0);
+
+    gut_vt_free(&vt);
+    gut_buf_free(&b);
+}
+
 int
 main(void)
 {
@@ -414,6 +511,7 @@ main(void)
     test_encode();
     test_copy();
     test_vt();
+    test_scrollback();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

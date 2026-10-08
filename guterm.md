@@ -706,8 +706,53 @@ place.
 `gut_vt_resize` resizes the buffer and keeps the emulation consistent:
 the scroll region is reset when it covered the whole screen or no longer
 fits, the cursor and saved cursor are clamped, and tab stops are kept or
-extended. Use it instead of `gut_buf_resize` while the VT layer is
-attached.
+extended. Lines above the cursor move into the scrollback when the
+screen becomes too short for it, and lines come back out of the
+scrollback when the screen grows. Use it instead of `gut_buf_resize`
+while the VT layer is attached.
+
+### Scrollback
+
+```c
+int  gut_vt_set_scrollback(struct gut_vt *vt, int lines);
+int  gut_vt_scrollback_lines(const struct gut_vt *vt);
+void gut_vt_clear_scrollback(struct gut_vt *vt);
+int  gut_vt_set_view(struct gut_vt *vt, int offset);
+int  gut_vt_scroll_view(struct gut_vt *vt, int delta);
+int  gut_vt_view_offset(const struct gut_vt *vt);
+```
+
+Lines that scroll off the top of the primary screen are kept in a ring
+of `GUT_VT_SCROLLBACK_DEFAULT` (1000) lines. `gut_vt_set_scrollback`
+changes the capacity at any time, keeping the newest lines, and 0
+disables the scrollback. Each stored line is trimmed to its last
+non-blank cell, so memory follows the content rather than the width.
+
+A line enters the scrollback when a line feed, IND or NEL at the bottom
+of the screen, or SU, scrolls the whole screen, that is when the scroll
+region starts at row 0. Scrolling inside a DECSTBM region that starts
+lower, IL and DL, and anything on the alternate screen leave the
+scrollback alone. ED 3 (`CSI 3 J`, the second half of `clear`) and
+`gut_vt_reset` discard it, as does `gut_vt_clear_scrollback`.
+
+The program looks into the scrollback by moving the view.
+`gut_vt_set_view(vt, n)` shows the screen scrolled back by `n` lines:
+the top `n` rows of the buffer come from the scrollback and the rest
+from the top of the live screen, with the cursor hidden. `n` is clamped
+to what the scrollback holds and to 0 on the alternate screen, and the
+offset in effect is returned. `gut_vt_scroll_view` moves relative to the
+current offset, positive being further back. `gut_vt_set_view(vt, 0)`
+returns to the live screen. A typical host binds Shift+PageUp and the
+wheel to `gut_vt_scroll_view` and calls `gut_vt_set_view(vt, 0)` before
+sending any key to the child, which is what `examples/term.c` does.
+
+While the view is scrolled back, `gut_vt_feed` keeps interpreting output
+into a private copy of the screen and the buffer keeps showing the view,
+which stays on the same lines as new ones arrive, until the oldest line
+in view falls out of the ring. The rows the view changes are marked
+dirty, so presenting works as usual. The program should not write to
+the buffer itself while scrolled back, since the live screen is restored
+over it when the view returns to 0.
 
 ### What is interpreted
 
@@ -721,8 +766,8 @@ Controls: BEL, BS, HT, LF, VT, FF, CR, SO, SI.
 Cursor: CUU, CUD, CUF, CUB, CNL, CPL, CHA, HPA, CUP, HVP, VPA, CBT, save
 and restore with both DECSC/DECRC and SCOSC/SCORC, IND, RI, NEL.
 
-Erasing and editing: ED including the xterm scrollback variant, EL, ECH,
-ICH, DCH, IL, DL, SU, SD.
+Erasing and editing: ED including ED 3 that clears the scrollback, EL,
+ECH, ICH, DCH, IL, DL, SU, SD.
 
 Attributes: SGR with bold, dim, italic, underline, blink, reverse,
 hidden, strike, the 8 and 16 color sets, 256 colors and 24 bit color.
@@ -743,7 +788,7 @@ OSC 0 and 2 set the title. Other OSC, all DCS, APC, PM and SOS strings,
 and unknown CSI and ESC sequences are consumed and ignored, so a program
 that emits sequences the emulator does not know still displays sanely.
 
-Not implemented: scrollback, mouse report generation, OSC 52 clipboard,
+Not implemented: mouse report generation, OSC 52 clipboard,
 kitty keyboard protocol, XTWINOPS, character set designations other than
 ASCII and line drawing, and combining characters, which are dropped.
 
@@ -791,6 +836,9 @@ The shape of a program that runs a shell, from `examples/term.c`:
    and write whatever the user did, and present.
 4. On `GUT_EVENT_RESIZE`, call `gut_vt_resize()` and set the pseudo
    terminal's window size.
+5. Shift+PageUp, Shift+PageDown and the wheel move the view with
+   `gut_vt_scroll_view()`; any key, text or paste sent to the child
+   first returns the view to the live screen.
 
 ## 12. Threads, blocking and other event sources
 
@@ -919,4 +967,7 @@ Window, needs SDL3: `gut_open`, `gut_close`, `gut_error`, `gut_present`,
 
 VT, no dependencies: `gut_vt_init`, `gut_vt_free`, `gut_vt_reset`,
 `gut_vt_feed`, `gut_vt_resize`, `gut_vt_modes`, `gut_vt_encode_flags`,
-`gut_vt_set_reply`, `gut_vt_set_title_cb`, `gut_vt_set_bell_cb`.
+`gut_vt_set_scrollback`, `gut_vt_scrollback_lines`,
+`gut_vt_clear_scrollback`, `gut_vt_set_view`, `gut_vt_scroll_view`,
+`gut_vt_view_offset`, `gut_vt_set_reply`, `gut_vt_set_title_cb`,
+`gut_vt_set_bell_cb`.

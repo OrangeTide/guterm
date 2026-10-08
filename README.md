@@ -105,7 +105,8 @@ make cov      # tests with gcov, line report in _out/cov/guterm.h.gcov
 - `examples/vtdemo.c` feeds a built-in escape sequence script, or a file
   given on the command line, through the VT layer. Typed keys are
   encoded and looped back into the emulator.
-- `examples/term.c` runs `$SHELL` on a pseudo terminal inside the window.
+- `examples/term.c` runs `$SHELL` on a pseudo terminal inside the window
+  with scrollback on Shift+PageUp and the wheel.
   POSIX only.
 - `tests/test_vt.c` checks the buffer, UTF-8, font map, key encoder and
   VT layer, built with `GUTERM_NO_WINDOW`.
@@ -136,7 +137,7 @@ Windows and macOS are expected to take.
 
 Not yet done:
 
-- Scrollback, selection and mouse reporting in the VT layer.
+- Selection and mouse reporting in the VT layer.
 - Blink is accepted but drawn as normal text.
 - Combining characters are dropped; wide characters use two cells but
   the built-in font has no CJK glyphs, so they draw as `?`.

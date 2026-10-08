@@ -4,7 +4,9 @@
  * POSIX only. Spawns $SHELL (or /bin/sh) on a pseudo terminal, feeds its
  * output through the VT layer and sends encoded key events back. It is a
  * demonstration of the VT layer, not a complete terminal: there is no
- * scrollback, selection or mouse reporting.
+ * selection or mouse reporting. Shift+PageUp, Shift+PageDown and the
+ * wheel scroll back; any key sent to the shell returns to the live
+ * screen.
  */
 
 #define GUTERM_IMPLEMENTATION
@@ -153,9 +155,22 @@ handle_event(struct app *a, const struct gut_event *ev, int *running)
         resize(a, ev->rows, ev->cols);
         break;
     case GUT_EVENT_KEY:
+        if (ev->mods == GUT_MOD_SHIFT && ev->key == GUT_KEY_PAGEUP) {
+            gut_vt_scroll_view(&a->vt, a->buf.rows - 1);
+            break;
+        }
+        if (ev->mods == GUT_MOD_SHIFT && ev->key == GUT_KEY_PAGEDOWN) {
+            gut_vt_scroll_view(&a->vt, -(a->buf.rows - 1));
+            break;
+        }
+        /* fall through */
     case GUT_EVENT_TEXT:
     case GUT_EVENT_PASTE:
+        gut_vt_set_view(&a->vt, 0);
         send_event(a, ev);
+        break;
+    case GUT_EVENT_MOUSE_WHEEL:
+        gut_vt_scroll_view(&a->vt, ev->dy * 3);
         break;
     default:
         break;
