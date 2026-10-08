@@ -30,7 +30,7 @@ Decisions:
 - Running on a real high density display needs hardware this plan
   cannot reach. It stays a manual item on the release checklist.
 
-Phases (in the vedit checkout for 1 to 3):
+Phases (in the vedit checkout for 1 to 3; 1 is done):
 
 1. `gut_wake` in gvedit. Sync the header, add the watcher thread and
    its control pipe, and make the window wait block in `gut_poll` with
