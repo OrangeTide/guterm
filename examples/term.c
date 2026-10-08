@@ -330,6 +330,8 @@ main(void)
     }
     gut_buf_init(&a.buf, desc.rows, desc.cols);
     gut_vt_init(&a.vt, &a.buf);
+    gut_vt_set_cell_size(&a.vt, gut_font_default()->glyph_w,
+                         gut_font_default()->glyph_h);
     gut_vt_set_reply(&a.vt, on_reply, &a);
     gut_vt_set_title_cb(&a.vt, on_title, &a);
     gut_vt_set_clipboard_cb(&a.vt, on_clipboard, NULL, &a);

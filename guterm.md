@@ -105,7 +105,7 @@ guterm has three layers, each usable without the ones above it.
 
 | Layer | Type | Depends on | Purpose |
 | --- | --- | --- | --- |
-| Buffer | `struct gut_buf` | libc | A grid of cells plus a cursor. The program owns it. |
+| Buffer | `struct gut_buf` | libc | A grid of cells plus a cursor and pictures pinned to it. The program owns it. |
 | Window | `gut_window` | SDL3 | Draws a buffer and delivers events. |
 | VT | `struct gut_vt` | libc | Interprets escape sequences into a buffer. |
 
@@ -1041,10 +1041,10 @@ with the primary screen parked and restored.
 
 Tabs: HTS, TBC for one stop and for all.
 
-Reports: DA1 answers as a VT100 with advanced video and sixel graphics, DSR 5 and 6 answer
-status and cursor position. XTSMGRAPHICS
-answers the color register count and the pixel area a picture may
-cover. RIS performs a full reset.
+Reports: DA1 answers as a VT100 with advanced video and sixel
+graphics, DSR 5 and 6 answer status and cursor position, and
+XTSMGRAPHICS answers the color register count and the pixel area a
+picture may cover. RIS performs a full reset.
 
 OSC 0 and 2 set the title and OSC 52 reaches the clipboard, both
 through callbacks. Sixel pictures are placed on the screen, see below.
@@ -1267,8 +1267,8 @@ handled: cells are whole framebuffer pixels and the window is sized in
 points accordingly. The SDL event loop must run on the main thread.
 
 **Raspberry Pi.** Use the KMS or X11 driver with the VC4 or V3D Mesa
-stack. The renderer's one program, one buffer and one texture are well
-within what the hardware does comfortably. Scale 1 is sensible on a small
+stack. The renderer's one program, one buffer and a texture per picture
+are well within what the hardware does comfortably. Scale 1 is sensible on a small
 display.
 
 **Terminal programs.** A program that handles its own ANSI output and

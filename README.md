@@ -11,7 +11,8 @@ the optional VT layer and let that fill the grid.
 
 - SDL3 provides the window, the GL context and input.
 - Rendering uses the OpenGL ES 2.0 subset: one program, one vertex
-  buffer, one RGBA glyph atlas. The shaders are GLSL ES 1.00, which also
+  buffer, one RGBA glyph atlas, and one texture per sixel picture on
+  screen. The shaders are GLSL ES 1.00, which also
   compiles as GLSL 1.10 on desktop compatibility contexts, so the same
   source runs on GLES 2 and 3, on desktop GL, and through ANGLE when a
   platform needs it. ANGLE is not required and is not used on Linux.
@@ -24,9 +25,9 @@ The header has three layers:
 
 | Layer | Depends on | Purpose |
 | --- | --- | --- |
-| `gut_buf` | libc | The cell grid: codepoint, colors, attributes, cursor. |
+| `gut_buf` | libc | The cell grid: codepoint, colors, attributes, cursor, and pictures pinned to it. |
 | `gut_window` | SDL3 | Opens a window, draws a `gut_buf`, delivers `gut_event`s. |
-| `gut_vt` | libc | Optional VT100/xterm emulator that writes into a `gut_buf`. |
+| `gut_vt` | libc | Optional VT100/xterm emulator with sixel graphics that writes into a `gut_buf`. |
 
 `gut_encode_event()` turns input events into the byte sequences an xterm
 sends, for programs that already speak the terminal protocol, including
@@ -109,8 +110,9 @@ make cov      # tests with gcov, line report in _out/cov/guterm.h.gcov
 
 - `examples/demo.c` exercises the cell API: palettes, attributes, glyph
   coverage, cursor shapes and input echo.
-- `examples/vtdemo.c` feeds a built-in escape sequence script, or a file
-  given on the command line, through the VT layer. Typed keys are
+- `examples/vtdemo.c` feeds a built-in escape sequence script, with a
+  sixel picture in it, or a file given on the command line, through the
+  VT layer. Typed keys are
   encoded and looped back into the emulator.
 - `examples/term.c` runs `$SHELL` on a pseudo terminal inside the window
   with scrollback on Shift+PageUp and the wheel.

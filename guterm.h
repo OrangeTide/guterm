@@ -6,7 +6,8 @@
  *
  * The primary interface is the cell buffer, struct gut_buf. A program
  * fills it with gut_buf_put() and friends, or lets the optional VT layer
- * fill it from a byte stream, then hands it to gut_present() to draw.
+ * fill it from a byte stream, sixel pictures included, then hands it to
+ * gut_present() to draw.
  * Input comes back as struct gut_event records from gut_poll(), and
  * gut_encode_event() turns those into xterm style key bytes for programs
  * that speak the terminal protocol.

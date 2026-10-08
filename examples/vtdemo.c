@@ -29,10 +29,12 @@ static const char builtin[] =
     "\r\n"
     "Cursor save/restore: \0337XXXX\0338OK  \r\n"
     "Insert: \033[4h__\033[4l (the underscores were inserted)\r\n"
-    "\r\n"
+    "Sixel: \033Pq#1;2;100;30;30#2;2;30;100;30#3;2;30;30;100"
+    "#1!10~#2!10~#3!10~-#3!10~#1!10~#2!10~\033\\"
+    "^ a 30 by 12 pixel picture; the cursor lands below it\r\n"
     "\033[3;1H\033[s\033[20;1H\033[u"
-    "\033[12;1HScroll region test:\r\n"
-    "\033[13;18r\033[13;1H"
+    "\033[13;1HScroll region test:\r\n"
+    "\033[14;19r\033[14;1H"
     "line 1\r\nline 2\r\nline 3\r\nline 4\r\nline 5\r\nline 6\r\n"
     "line 7 (scrolled)\r\nline 8 (scrolled)"
     "\033[r"
@@ -83,6 +85,8 @@ main(int argc, char **argv)
     }
     gut_buf_init(&buf, desc.rows, desc.cols);
     gut_vt_init(&vt, &buf);
+    gut_vt_set_cell_size(&vt, gut_font_default()->glyph_w,
+                         gut_font_default()->glyph_h);
     app.w = w;
     app.vt = &vt;
     gut_vt_set_title_cb(&vt, on_title, &app);

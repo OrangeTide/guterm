@@ -52,57 +52,13 @@ things.
 - Selection does not follow content when the VT view scrolls or output
   moves it; hosts clear it instead.
 
-## Sixel
-
-Planned in five phases, each landing with its tests before the next
-starts. About 1,200 to 1,400 lines, four to five sessions. No shader
-change: the fragment shader multiplies the vertex color by a texture
-sample, so an RGBA image drawn with a white vertex color renders as is.
-
-Decisions:
-
-- Placements live in the buffer layer: image id, RGBA pixels, pixel
-  size, anchor row and column, rows and columns spanned. Scroll shifts
-  anchors and drops placements that leave the screen; clear rows, IL, DL
-  and ED cut or drop them. The alternate screen parks and restores its
-  own list. A host that draws its own buffer may ignore the list at no
-  cost: nothing in the cell API changes.
-- A resize drops every placement. This is documented behavior, not a
-  gap to fill later.
-- Text draws over images. Writing a character onto an image cell leaves
-  the image behind it; erase sequences cut it. The xterm behavior of
-  punching a hole per overwritten cell is deferred.
-- Memory limits are settable on `gut_desc`: a per image pixel cap and a
-  total pixel budget per buffer. When a new image would exceed the
-  budget the least recently placed images are discarded until it fits.
-  An image larger than the per image cap, including the one being
-  decoded, is discarded and the decoder disables itself until ST, so a
-  hostile stream can never allocate without bound.
-- Images that scroll off the top are dropped. Scrollback images are not
-  in the first version, since they need pixels per stored line and a
-  composing view.
-
-Phases (1 to 4 are done):
-
-1. Decoder in the VT layer, streaming: DCS parameter parsing, the sixel
-   state machine, palette, repeat, raster attributes, transparent
-   background, the limits above. Headless unit tests on known tiny
-   images; torture feeds random sixel bytes.
-2. Buffer placements and their updates in scroll, clear rows, resize,
-   copy and free, with the LRU budget. Tests.
-3. VT integration: a cell size setter so image height converts to rows,
-   placement at the cursor, cursor advance and DECSDM (mode 80), DA1
-   advertising sixel, XTSMGRAPHICS geometry query, ED 2 and RIS dropping
-   images.
-4. Renderer: present flushes in batches (backgrounds, one textured quad
-   per placement, glyphs), a texture cache by image id freed with the
-   placement, cleanup in `gut_close`. Images scale by the window zoom.
-   Checked by screenshot under Xvfb.
-5. Docs and examples: manual section, README status, a sixel in the
-   vtdemo script, the shell example passing the cell size.
-
 ## Unplanned, possible
 
+- Pictures in the scrollback. A line that scrolls off the top drops its
+  band of a picture; keeping it needs pixels per stored line and a view
+  that composes them.
+- Erasing a picture cell by cell as xterm does. Text draws over a
+  picture and only whole row erases and colored backgrounds remove it.
 - Scrollback search, or a host API to read scrollback lines rather than
   only view them.
 - Answering OSC 52 queries in the shell example, behind a setting.
