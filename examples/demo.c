@@ -175,6 +175,27 @@ main(int argc, char **argv)
                                               " %02X", (unsigned char)bytes[i]);
                 }
                 break;
+            case GUT_EVENT_KEY_UP: {
+                /* the keys still down, the view a game would poll */
+                int keys[8];
+                int n = gut_keys_held(w, keys, 8);
+                size_t o;
+
+                o = (size_t)snprintf(status, sizeof(status),
+                                     "key up 0x%X, %d held:", ev.key, n);
+                for (int i = 0; i < n && i < 8 && o + 12 < sizeof(status);
+                     i++) {
+                    if (keys[i] < GUT_KEY_SPECIAL)
+                        o += (size_t)snprintf(status + o,
+                                              sizeof(status) - o, " %c",
+                                              keys[i]);
+                    else
+                        o += (size_t)snprintf(status + o,
+                                              sizeof(status) - o, " #%d",
+                                              keys[i] - GUT_KEY_SPECIAL);
+                }
+                break;
+            }
             case GUT_EVENT_TEXT:
                 if (echo_row >= buf.rows - 2) {
                     echo_row = 20;

@@ -480,7 +480,7 @@ torture_encode(unsigned long iterations)
         size_t n;
 
         memset(&ev, 0, sizeof(ev));
-        ev.type = rnd_range(GUT_EVENT_NONE, GUT_EVENT_PAD_AXIS);
+        ev.type = rnd_range(GUT_EVENT_NONE, GUT_EVENT_KEY_UP);
         ev.button = rnd_range(0, 4);
         ev.row = rnd_range(-1, 300);
         ev.col = rnd_range(-1, 300);

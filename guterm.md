@@ -494,6 +494,41 @@ fields are meaningful per type:
 | `GUT_EVENT_PAD_ADDED`, `GUT_EVENT_PAD_REMOVED` | `pad` | A game controller took or left a slot. |
 | `GUT_EVENT_PAD_DOWN`, `GUT_EVENT_PAD_UP` | `pad`, `button` | A controller button changed; `button` is an `enum gut_pad_button`. |
 | `GUT_EVENT_PAD_AXIS` | `pad`, `axis`, `value` | A stick or trigger moved. |
+| `GUT_EVENT_KEY_UP` | `key`, `mods` | A key was released. |
+
+### Key state
+
+```c
+int gut_key_held(const gut_window *w, int key);
+int gut_mouse_held(const gut_window *w, int button);
+int gut_mods_held(const gut_window *w);
+int gut_keys_held(const gut_window *w, int *keys, int n);
+```
+
+A text program acts on key presses. A game acts on what is held: the
+player moves while W is down and stops when it comes up, and two keys
+held together mean a diagonal. guterm sits between a terminal, which
+only ever sees presses, and a DOS text mode program, which could read
+the keyboard directly, so it offers both views.
+
+`gut_key_held` answers whether a key is down right now, by its `gut_key`
+code, lowercase for a letter so `'w'` is true whatever Shift is doing.
+`gut_mouse_held` does the same for a mouse button, `gut_mods_held`
+returns the modifiers as `GUT_MOD_*` bits, and `gut_keys_held` lists
+every key down, for a program that wants to show or log them.
+
+The state is kept from the key events `gut_poll` has delivered, so it
+is as current as the last poll; a game loop drains the queue, then reads
+the state, then simulates and draws. Auto-repeat does not disturb it,
+and `GUT_EVENT_KEY_UP` reports each release for programs that want the
+edge too. When the window loses focus every key and button is released,
+since the releases that happen while another window has the keyboard
+are never seen; `GUT_EVENT_FOCUS_OUT` arrives at the same moment.
+
+Keys are named by the symbol on them, so a game that reads `'w'`,
+`'a'`, `'s'` and `'d'` reads the letters in those positions on a QWERTY
+layout and other letters elsewhere. A game that cares should let the
+player rebind.
 
 ### Keys versus text
 
@@ -1205,7 +1240,8 @@ Window, needs SDL3: `gut_open`, `gut_close`, `gut_error`, `gut_present`,
 `gut_set_defaults`, `gut_set_palette`, `gut_clipboard_get`,
 `gut_clipboard_set`, `gut_primary_get`, `gut_primary_set`,
 `gut_set_text_input`, `gut_set_compose_overlay`, `gut_set_selection`,
-`gut_pad_get`, `gut_pad_rumble`, `gut_ticks`.
+`gut_pad_get`, `gut_pad_rumble`, `gut_key_held`, `gut_mouse_held`,
+`gut_mods_held`, `gut_keys_held`, `gut_ticks`.
 
 VT, no dependencies: `gut_vt_init`, `gut_vt_free`, `gut_vt_reset`,
 `gut_vt_feed`, `gut_vt_resize`, `gut_vt_modes`, `gut_vt_encode_flags`,

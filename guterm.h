@@ -231,6 +231,7 @@ enum gut_event_type {
     GUT_EVENT_PAD_DOWN,     /* pad, button: enum gut_pad_button */
     GUT_EVENT_PAD_UP,
     GUT_EVENT_PAD_AXIS,     /* pad, axis: enum gut_pad_axis, value */
+    GUT_EVENT_KEY_UP,       /* key, mods: a key was released */
 };
 
 enum gut_mod {
@@ -500,6 +501,24 @@ GUT_API int gut_pad_get(const gut_window *w, int slot, struct gut_pad *out);
  * -1 when the slot is empty or the pad cannot rumble. */
 GUT_API int gut_pad_rumble(gut_window *w, int slot, uint16_t low,
                            uint16_t high, uint32_t ms);
+
+/* Key state, for programs that act on what is held rather than on
+ * key presses: a game moving while W is down. The state is kept from
+ * the key events gut_poll() has delivered, so it is as current as the
+ * last poll, and every key is released when the window loses focus. */
+
+/** Whether a key is held: a gut_key code, lowercase for a letter. */
+GUT_API int gut_key_held(const gut_window *w, int key);
+
+/** Whether a mouse button is held, by enum gut_button. */
+GUT_API int gut_mouse_held(const gut_window *w, int button);
+
+/** The modifiers held now, as GUT_MOD_* bits. */
+GUT_API int gut_mods_held(const gut_window *w);
+
+/** Keys held right now, up to n of them, into keys. Returns the count
+ * held, which may exceed n. */
+GUT_API int gut_keys_held(const gut_window *w, int *keys, int n);
 
 /** Milliseconds since gut_open(). */
 GUT_API uint64_t gut_ticks(const gut_window *w);
@@ -2488,6 +2507,10 @@ struct gut_window {
     SDL_Gamepad *pads[GUT_MAX_PADS];
     SDL_JoystickID pad_ids[GUT_MAX_PADS];
     struct gut_pad pad_state[GUT_MAX_PADS];
+
+    int held[64];               /* keys down, by gut_key code */
+    int nheld;
+    int mouse_held;             /* bit (1 << gut_button) per button */
 };
 
 static const uint32_t gut_default_palette[16] = {
@@ -3532,6 +3555,57 @@ gut_paste_event(gut_window *w, struct gut_event *ev, const char *text,
     return 1;
 }
 
+/* ---- key state ---- */
+
+static int
+gut_held_find(const gut_window *w, int key)
+{
+    for (int i = 0; i < w->nheld; i++)
+        if (w->held[i] == key)
+            return i;
+    return -1;
+}
+
+static void
+gut_held_set(gut_window *w, int key, int down)
+{
+    int i = gut_held_find(w, key);
+
+    if (down) {
+        if (i < 0 && w->nheld < (int)(sizeof(w->held) / sizeof(w->held[0])))
+            w->held[w->nheld++] = key;
+    } else if (i >= 0) {
+        w->held[i] = w->held[--w->nheld];
+    }
+}
+
+int
+gut_key_held(const gut_window *w, int key)
+{
+    return gut_held_find(w, key) >= 0;
+}
+
+int
+gut_mouse_held(const gut_window *w, int button)
+{
+    return button > 0 && button < 31 && (w->mouse_held & (1 << button)) != 0;
+}
+
+int
+gut_mods_held(const gut_window *w)
+{
+    (void)w;
+    return gut_mods_from_sdl(SDL_GetModState());
+}
+
+int
+gut_keys_held(const gut_window *w, int *keys, int n)
+{
+    for (int i = 0; i < w->nheld && i < n; i++)
+        keys[i] = w->held[i];
+    return w->nheld;
+}
+
 static int
 gut_translate(gut_window *w, const SDL_Event *e, struct gut_event *ev)
 {
@@ -3562,6 +3636,8 @@ gut_translate(gut_window *w, const SDL_Event *e, struct gut_event *ev)
         return 1;
     case SDL_EVENT_WINDOW_FOCUS_LOST:
         w->focused = 0;
+        w->nheld = 0;           /* releases are not seen while away */
+        w->mouse_held = 0;
         ev->type = GUT_EVENT_FOCUS_OUT;
         return 1;
     case SDL_EVENT_KEY_DOWN:
@@ -3571,9 +3647,18 @@ gut_translate(gut_window *w, const SDL_Event *e, struct gut_event *ev)
         ev->type = GUT_EVENT_KEY;
         ev->mods = gut_mods_from_sdl(e->key.mod);
         ev->repeat = e->key.repeat ? 1 : 0;
+        gut_held_set(w, ev->key, 1);
         if (w->paste_keys && gut_is_paste_chord(ev) &&
             gut_paste_event(w, ev, gut_clipboard_get(w), 0))
             return 1;
+        return 1;
+    case SDL_EVENT_KEY_UP:
+        ev->key = gut_key_from_sdl(e->key.key);
+        if (ev->key == GUT_KEY_NONE)
+            return 0;
+        ev->type = GUT_EVENT_KEY_UP;
+        ev->mods = gut_mods_from_sdl(e->key.mod);
+        gut_held_set(w, ev->key, 0);
         return 1;
     case SDL_EVENT_TEXT_INPUT:
         ev->type = GUT_EVENT_TEXT;
@@ -3611,6 +3696,12 @@ gut_translate(gut_window *w, const SDL_Event *e, struct gut_event *ev)
                    : e->button.button == SDL_BUTTON_RIGHT ? GUT_BUTTON_RIGHT
                    : 0;
         ev->clicks = e->button.clicks;
+        if (ev->button) {
+            if (ev->type == GUT_EVENT_MOUSE_DOWN)
+                w->mouse_held |= 1 << ev->button;
+            else
+                w->mouse_held &= ~(1 << ev->button);
+        }
         if (w->paste_keys && ev->type == GUT_EVENT_MOUSE_DOWN &&
             ev->button == GUT_BUTTON_MIDDLE &&
             gut_paste_event(w, ev, gut_primary_get(w), 1))
