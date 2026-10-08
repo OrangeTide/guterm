@@ -226,6 +226,11 @@ enum gut_event_type {
     GUT_EVENT_FOCUS_OUT,
     GUT_EVENT_COMPOSE,      /* data, len, cursor: IME text in progress */
     GUT_EVENT_PASTE,        /* data, len, primary; col, row for primary */
+    GUT_EVENT_PAD_ADDED,    /* pad: a game controller was connected */
+    GUT_EVENT_PAD_REMOVED,  /* pad */
+    GUT_EVENT_PAD_DOWN,     /* pad, button: enum gut_pad_button */
+    GUT_EVENT_PAD_UP,
+    GUT_EVENT_PAD_AXIS,     /* pad, axis: enum gut_pad_axis, value */
 };
 
 enum gut_mod {
@@ -274,6 +279,38 @@ enum gut_button {
     GUT_BUTTON_RIGHT = 3,
 };
 
+/* Game controller buttons, in the Xbox layout SDL maps every pad to. */
+enum gut_pad_button {
+    GUT_PAD_A,              /* south */
+    GUT_PAD_B,              /* east */
+    GUT_PAD_X,              /* west */
+    GUT_PAD_Y,              /* north */
+    GUT_PAD_BACK,
+    GUT_PAD_GUIDE,
+    GUT_PAD_START,
+    GUT_PAD_LSTICK,
+    GUT_PAD_RSTICK,
+    GUT_PAD_LSHOULDER,
+    GUT_PAD_RSHOULDER,
+    GUT_PAD_UP,
+    GUT_PAD_DOWN,
+    GUT_PAD_LEFT,
+    GUT_PAD_RIGHT,
+    GUT_PAD_BUTTON_COUNT,
+};
+
+enum gut_pad_axis {
+    GUT_PAD_AXIS_LX,        /* sticks: -32768 left or up to 32767 */
+    GUT_PAD_AXIS_LY,
+    GUT_PAD_AXIS_RX,
+    GUT_PAD_AXIS_RY,
+    GUT_PAD_AXIS_LT,        /* triggers: 0 released to 32767 */
+    GUT_PAD_AXIS_RT,
+    GUT_PAD_AXIS_COUNT,
+};
+
+#define GUT_MAX_PADS 4
+
 struct gut_event {
     int type;           /* enum gut_event_type */
     int key;            /* enum gut_key or codepoint */
@@ -287,9 +324,13 @@ struct gut_event {
     int primary;        /* PASTE: 1 from the primary selection */
     int col, row;       /* mouse position in cells */
     int x, y;           /* mouse position in pixels */
-    int button;         /* enum gut_button */
+    int button;         /* enum gut_button, or enum gut_pad_button */
+    int clicks;         /* MOUSE_DOWN: 1 single, 2 double, 3 triple */
     int dx, dy;         /* wheel notches */
     int cols, rows;     /* GUT_EVENT_RESIZE */
+    int pad;            /* PAD events: controller slot 0 to 3 */
+    int axis;           /* PAD_AXIS: enum gut_pad_axis */
+    int value;          /* PAD_AXIS: -32768 to 32767 */
 };
 
 /* gut_encode_event flags */
@@ -297,17 +338,75 @@ struct gut_event {
 #define GUT_ENC_BS_DEL        (1 << 1)  /* backspace sends DEL (default) */
 #define GUT_ENC_BS_BS         (1 << 2)  /* backspace sends BS */
 #define GUT_ENC_BRACKET_PASTE (1 << 3)  /* wrap pastes in CSI 200~ 201~ */
+#define GUT_ENC_MOUSE_BTN     (1 << 4)  /* mode 1000: presses and releases */
+#define GUT_ENC_MOUSE_DRAG    (1 << 5)  /* mode 1002: also motion with a
+                                           button held */
+#define GUT_ENC_MOUSE_ANY     (1 << 6)  /* mode 1003: all motion */
+#define GUT_ENC_MOUSE_SGR     (1 << 7)  /* mode 1006: CSI < b;x;y M form */
+#define GUT_ENC_FOCUS         (1 << 8)  /* mode 1004: CSI I and CSI O */
 
 /** Translate an event into the bytes an xterm would send a program.
  * GUT_EVENT_TEXT copies the text. GUT_EVENT_KEY encodes special keys and
  * Ctrl or Alt combinations; a plain printable key yields nothing because
  * the matching GUT_EVENT_TEXT carries it. GUT_EVENT_PASTE copies the
  * pasted text with newlines turned into carriage returns, bracketed when
- * the flag asks for it. Like snprintf, returns the length the full
- * encoding needs and writes at most n - 1 bytes plus a NUL. 16 bytes
- * cover every key; a paste needs ev->len + 16. */
+ * the flag asks for it. Mouse events become xterm mouse reports under
+ * the GUT_ENC_MOUSE_* flags and focus events become CSI I and CSI O
+ * under GUT_ENC_FOCUS. Like snprintf, returns the length the full
+ * encoding needs and writes at most n - 1 bytes plus a NUL. 32 bytes
+ * cover every key and mouse report; a paste needs ev->len + 16. */
 GUT_API size_t gut_encode_event(const struct gut_event *ev, char *out,
                                 size_t n, int flags);
+
+/****************************************************************
+ * Selection
+ *
+ * Tracks a mouse driven selection over a buffer. gut_sel_mouse()
+ * consumes mouse events: left press starts a selection, a double click
+ * selects words and a triple click lines, dragging extends, Shift+click
+ * extends the existing selection, and Alt makes it a rectangle. The
+ * selection is in buffer cells and goes stale when the buffer scrolls;
+ * clear it then. The window highlights it through gut_set_selection().
+ ****************************************************************/
+
+enum gut_sel_unit {
+    GUT_SEL_CELL,
+    GUT_SEL_WORD,
+    GUT_SEL_LINE,
+};
+
+struct gut_sel {
+    int active;             /* a selection exists */
+    int dragging;           /* the button is still held */
+    int mode;               /* enum gut_copy_mode */
+    int unit;               /* enum gut_sel_unit */
+    int anchor_row, anchor_col;
+    int row0, col0;         /* normalised: start, inclusive */
+    int row1, col1;         /* end, inclusive */
+};
+
+GUT_API void gut_sel_clear(struct gut_sel *s);
+
+/** Start a selection at a cell. */
+GUT_API void gut_sel_begin(struct gut_sel *s, const struct gut_buf *b,
+                           int row, int col, int mode, int unit);
+
+/** Move the far end of the selection to a cell; the unit snaps both
+ * ends outward. */
+GUT_API void gut_sel_extend(struct gut_sel *s, const struct gut_buf *b,
+                            int row, int col);
+
+/** Interpret a mouse event. Returns 1 when the selection changed, so the
+ * caller knows to present and, on release, to publish the text. */
+GUT_API int gut_sel_mouse(struct gut_sel *s, const struct gut_buf *b,
+                          const struct gut_event *ev);
+
+GUT_API int gut_sel_contains(const struct gut_sel *s, int row, int col);
+
+/** The selected text, with gut_buf_copy_text() sizing. 0 when there is
+ * no selection. */
+GUT_API size_t gut_sel_text(const struct gut_sel *s, const struct gut_buf *b,
+                            char *out, size_t n);
 
 /****************************************************************
  * Window
@@ -326,6 +425,7 @@ struct gut_desc {
     int no_paste_keys;              /* 1 delivers paste chords as keys */
     int no_compose_overlay;         /* 1 leaves IME preedit drawing to
                                        the program */
+    int no_gamepad;                 /* 1 skips game controller support */
 };
 
 typedef struct gut_window gut_window;
@@ -376,6 +476,29 @@ GUT_API void gut_set_text_input(gut_window *w, int on);
  * itself from GUT_EVENT_COMPOSE turns it off. */
 GUT_API void gut_set_compose_overlay(gut_window *w, int on);
 
+/** Highlight a selection on the next gut_present(), drawn with the
+ * cell colors swapped. The struct is copied; NULL clears it. */
+GUT_API void gut_set_selection(gut_window *w, const struct gut_sel *sel);
+
+/* Game controllers. Up to GUT_MAX_PADS are tracked in slots 0 to 3,
+ * assigned in connection order; a slot is reused after its pad leaves.
+ * Changes arrive as GUT_EVENT_PAD_* events and the whole state can be
+ * polled at any time. */
+struct gut_pad {
+    int connected;
+    char name[64];
+    uint32_t buttons;       /* bit (1 << gut_pad_button) per held button */
+    int16_t axes[GUT_PAD_AXIS_COUNT];
+};
+
+/** Copy the state of a slot. Returns 1 when a pad is connected there. */
+GUT_API int gut_pad_get(const gut_window *w, int slot, struct gut_pad *out);
+
+/** Vibrate for ms milliseconds, intensities 0 to 65535. Returns 0, or
+ * -1 when the slot is empty or the pad cannot rumble. */
+GUT_API int gut_pad_rumble(gut_window *w, int slot, uint16_t low,
+                           uint16_t high, uint32_t ms);
+
 /** Milliseconds since gut_open(). */
 GUT_API uint64_t gut_ticks(const gut_window *w);
 
@@ -399,6 +522,8 @@ GUT_API const char *gut_error(void);
 #define GUT_VT_MODE_APP_CURSOR   (1u << 5)
 #define GUT_VT_MODE_APP_KEYPAD   (1u << 6)
 #define GUT_VT_MODE_MOUSE        (1u << 7)
+#define GUT_VT_MODE_MOUSE_SGR    (1u << 8)
+#define GUT_VT_MODE_FOCUS        (1u << 9)
 
 #define GUT_VT_MAX_PARAMS 16
 #define GUT_VT_OSC_MAX    1024
@@ -427,6 +552,7 @@ struct gut_vt {
     int scroll_top, scroll_bot; /* inclusive top, exclusive bottom */
     unsigned modes;
     int mouse_mode;             /* 0, 1000, 1002 or 1003 */
+    int mouse_row, mouse_col;   /* last cell reported for motion */
     uint16_t attrs;
     struct gut_color fg, bg;
     int charset;                /* 0 = G0, 1 = G1 */
@@ -486,6 +612,16 @@ GUT_API unsigned gut_vt_modes(const struct gut_vt *vt);
 
 /** gut_encode_event() flags matching the current modes. */
 GUT_API int gut_vt_encode_flags(const struct gut_vt *vt);
+
+/** Encode a mouse or focus event for the program when it asked for
+ * reports, with the xterm conventions a host would otherwise have to
+ * know: Shift bypasses tracking so the host can select, motion is
+ * reported only when the cell changes, and the wheel on the alternate
+ * screen with no tracking becomes three cursor key presses. Returns
+ * the length with gut_encode_event() sizing, or 0 when the event is the
+ * host's to use. */
+GUT_API size_t gut_vt_mouse(struct gut_vt *vt, const struct gut_event *ev,
+                            char *out, size_t n);
 
 /** Set how many lines the scrollback keeps, 0 to disable. The newest
  * lines survive a shrink. Returns 0 or -1. */
@@ -1119,6 +1255,76 @@ gut_enc_mods(int mods)
     return m;
 }
 
+/* xterm mouse report. Returns the length, 0 when the flags do not ask
+ * for this event or the position does not fit the legacy encoding. */
+static size_t
+gut_encode_mouse(const struct gut_event *ev, char *out, size_t n, int flags)
+{
+    int code, release = 0;
+    int col = ev->col + 1, row = ev->row + 1;
+    size_t len;
+
+    if (!(flags & (GUT_ENC_MOUSE_BTN | GUT_ENC_MOUSE_DRAG |
+                   GUT_ENC_MOUSE_ANY)))
+        return 0;
+    switch (ev->type) {
+    case GUT_EVENT_MOUSE_DOWN:
+    case GUT_EVENT_MOUSE_UP:
+        if (ev->button < GUT_BUTTON_LEFT || ev->button > GUT_BUTTON_RIGHT)
+            return 0;
+        code = ev->button - 1;
+        release = ev->type == GUT_EVENT_MOUSE_UP;
+        break;
+    case GUT_EVENT_MOUSE_MOVE:
+        if (ev->button) {
+            if (!(flags & (GUT_ENC_MOUSE_DRAG | GUT_ENC_MOUSE_ANY)))
+                return 0;
+            code = ev->button - 1;
+        } else {
+            if (!(flags & GUT_ENC_MOUSE_ANY))
+                return 0;
+            code = 3;
+        }
+        code += 32;
+        break;
+    case GUT_EVENT_MOUSE_WHEEL:
+        if (ev->dy > 0)
+            code = 64;
+        else if (ev->dy < 0)
+            code = 65;
+        else if (ev->dx < 0)
+            code = 66;
+        else if (ev->dx > 0)
+            code = 67;
+        else
+            return 0;
+        break;
+    default:
+        return 0;
+    }
+    if (ev->mods & GUT_MOD_SHIFT)
+        code += 4;
+    if (ev->mods & GUT_MOD_ALT)
+        code += 8;
+    if (ev->mods & GUT_MOD_CTRL)
+        code += 16;
+    if (flags & GUT_ENC_MOUSE_SGR) {
+        len = (size_t)snprintf(out, n, "\033[<%d;%d;%d%c", code, col, row,
+                               release ? 'm' : 'M');
+    } else {
+        char tmp[8];
+
+        if (col > 223 || row > 223 || col < 1 || row < 1)
+            return 0;
+        if (release)
+            code = (code & ~3) | 3;
+        len = (size_t)snprintf(tmp, sizeof(tmp), "\033[M%c%c%c",
+                               32 + code, 32 + col, 32 + row);
+        snprintf(out, n, "%s", tmp);
+    }
+    return len;
+}
+
 size_t
 gut_encode_event(const struct gut_event *ev, char *out, size_t n, int flags)
 {
@@ -1156,6 +1362,14 @@ gut_encode_event(const struct gut_event *ev, char *out, size_t n, int flags)
         gut_sink_end(&s);
         return s.len;
     }
+    if (ev->type == GUT_EVENT_FOCUS_IN || ev->type == GUT_EVENT_FOCUS_OUT) {
+        if (!(flags & GUT_ENC_FOCUS))
+            return 0;
+        return (size_t)snprintf(out, n, "\033[%c",
+                                ev->type == GUT_EVENT_FOCUS_IN ? 'I' : 'O');
+    }
+    if (ev->type >= GUT_EVENT_MOUSE_DOWN && ev->type <= GUT_EVENT_MOUSE_WHEEL)
+        return gut_encode_mouse(ev, out, n, flags);
     if (ev->type != GUT_EVENT_KEY)
         return 0;
 
@@ -1854,6 +2068,198 @@ gut_font_default(void)
     return &f;
 }
 
+/****************************************************************
+ * Selection
+ ****************************************************************/
+
+void
+gut_sel_clear(struct gut_sel *s)
+{
+    memset(s, 0, sizeof(*s));
+}
+
+static int
+gut_sel_is_word(const struct gut_buf *b, int row, int col)
+{
+    const struct gut_cell *c = &b->cells[row * b->cols + col];
+
+    return c->cp != ' ' && c->cp != 0 && c->cp != 0xA0;
+}
+
+/* Snap a point outward to the start (dir < 0) or end of its unit. */
+static void
+gut_sel_snap(const struct gut_sel *s, const struct gut_buf *b, int *row,
+             int *col, int dir)
+{
+    if (s->unit == GUT_SEL_LINE) {
+        *col = dir < 0 ? 0 : b->cols - 1;
+    } else if (s->unit == GUT_SEL_WORD && gut_sel_is_word(b, *row, *col)) {
+        while (*col + dir >= 0 && *col + dir < b->cols &&
+               gut_sel_is_word(b, *row, *col + dir))
+            *col += dir;
+    }
+}
+
+static void
+gut_sel_set(struct gut_sel *s, const struct gut_buf *b, int row, int col)
+{
+    int ar = s->anchor_row, ac = s->anchor_col;
+    int before;
+
+    row = gut_clamp(row, 0, b->rows - 1);
+    col = gut_clamp(col, 0, b->cols - 1);
+    if (s->mode == GUT_COPY_RECT) {
+        s->row0 = ar < row ? ar : row;
+        s->row1 = ar < row ? row : ar;
+        s->col0 = ac < col ? ac : col;
+        s->col1 = ac < col ? col : ac;
+        if (s->unit != GUT_SEL_CELL) {
+            s->col0 = 0;
+            s->col1 = b->cols - 1;
+        }
+        return;
+    }
+    before = row < ar || (row == ar && col < ac);
+    if (before) {
+        s->row0 = row;
+        s->col0 = col;
+        s->row1 = ar;
+        s->col1 = ac;
+    } else {
+        s->row0 = ar;
+        s->col0 = ac;
+        s->row1 = row;
+        s->col1 = col;
+    }
+    gut_sel_snap(s, b, &s->row0, &s->col0, -1);
+    gut_sel_snap(s, b, &s->row1, &s->col1, 1);
+    /* a continuation cell belongs with its wide character */
+    if (s->col0 > 0 && b->cells[s->row0 * b->cols + s->col0].width == 0)
+        s->col0--;
+    if (s->col1 + 1 < b->cols &&
+        b->cells[s->row1 * b->cols + s->col1 + 1].width == 0)
+        s->col1++;
+}
+
+void
+gut_sel_begin(struct gut_sel *s, const struct gut_buf *b, int row, int col,
+              int mode, int unit)
+{
+    memset(s, 0, sizeof(*s));
+    s->active = 1;
+    s->mode = mode == GUT_COPY_RECT ? GUT_COPY_RECT : GUT_COPY_STREAM;
+    s->unit = gut_clamp(unit, GUT_SEL_CELL, GUT_SEL_LINE);
+    s->anchor_row = gut_clamp(row, 0, b->rows - 1);
+    s->anchor_col = gut_clamp(col, 0, b->cols - 1);
+    gut_sel_set(s, b, row, col);
+}
+
+void
+gut_sel_extend(struct gut_sel *s, const struct gut_buf *b, int row, int col)
+{
+    if (!s->active)
+        return;
+    s->anchor_row = gut_clamp(s->anchor_row, 0, b->rows - 1);
+    s->anchor_col = gut_clamp(s->anchor_col, 0, b->cols - 1);
+    gut_sel_set(s, b, row, col);
+}
+
+int
+gut_sel_mouse(struct gut_sel *s, const struct gut_buf *b,
+              const struct gut_event *ev)
+{
+    switch (ev->type) {
+    case GUT_EVENT_MOUSE_DOWN:
+        if (ev->button != GUT_BUTTON_LEFT)
+            return 0;
+        if ((ev->mods & GUT_MOD_SHIFT) && s->active) {
+            /* the end nearer the click moves; the other end anchors */
+            int far_row = s->row1, far_col = s->col1;
+            int d0 = (ev->row - s->row0) * b->cols + ev->col - s->col0;
+            int d1 = (ev->row - s->row1) * b->cols + ev->col - s->col1;
+
+            if (d0 < 0)
+                d0 = -d0;
+            if (d1 < 0)
+                d1 = -d1;
+            if (d1 < d0) {
+                far_row = s->row0;
+                far_col = s->col0;
+            }
+            s->anchor_row = far_row;
+            s->anchor_col = far_col;
+            s->dragging = 1;
+            gut_sel_extend(s, b, ev->row, ev->col);
+            return 1;
+        }
+        {
+            int unit = ev->clicks >= 3 ? GUT_SEL_LINE
+                     : ev->clicks == 2 ? GUT_SEL_WORD : GUT_SEL_CELL;
+            int was_active = s->active;
+
+            gut_sel_begin(s, b, ev->row, ev->col,
+                          (ev->mods & GUT_MOD_ALT) ? GUT_COPY_RECT
+                                                   : GUT_COPY_STREAM, unit);
+            s->dragging = 1;
+            if (unit == GUT_SEL_CELL) {
+                /* a single click only clears until it is dragged */
+                s->active = 0;
+                return was_active;
+            }
+            return 1;
+        }
+    case GUT_EVENT_MOUSE_MOVE:
+        if (!s->dragging || ev->button != GUT_BUTTON_LEFT)
+            return 0;
+        if (!s->active) {
+            if (ev->row == s->anchor_row && ev->col == s->anchor_col)
+                return 0;
+            s->active = 1;
+        }
+        gut_sel_extend(s, b, ev->row, ev->col);
+        return 1;
+    case GUT_EVENT_MOUSE_UP:
+        if (!s->dragging || ev->button != GUT_BUTTON_LEFT)
+            return 0;
+        s->dragging = 0;
+        if (s->active)
+            gut_sel_extend(s, b, ev->row, ev->col);
+        return s->active;
+    default:
+        return 0;
+    }
+}
+
+int
+gut_sel_contains(const struct gut_sel *s, int row, int col)
+{
+    if (!s->active)
+        return 0;
+    if (s->mode == GUT_COPY_RECT)
+        return row >= s->row0 && row <= s->row1 &&
+               col >= s->col0 && col <= s->col1;
+    if (row < s->row0 || row > s->row1)
+        return 0;
+    if (row == s->row0 && col < s->col0)
+        return 0;
+    if (row == s->row1 && col > s->col1)
+        return 0;
+    return 1;
+}
+
+size_t
+gut_sel_text(const struct gut_sel *s, const struct gut_buf *b, char *out,
+             size_t n)
+{
+    if (!s->active) {
+        if (n)
+            out[0] = '\0';
+        return 0;
+    }
+    return gut_buf_copy_text(b, s->row0, s->col0, s->row1, s->col1, s->mode,
+                             out, n);
+}
+
 #ifndef GUTERM_NO_WINDOW
 
 #include <SDL3/SDL.h>
@@ -2048,8 +2454,15 @@ struct gut_window {
     int paste_keys;
     int overlay;
     int owns_video;             /* gut_open initialised SDL video */
+    int owns_gamepad;
     uint64_t t0;
     int focused;
+
+    struct gut_sel sel;         /* highlighted selection, if sel.active */
+
+    SDL_Gamepad *pads[GUT_MAX_PADS];
+    SDL_JoystickID pad_ids[GUT_MAX_PADS];
+    struct gut_pad pad_state[GUT_MAX_PADS];
 };
 
 static const uint32_t gut_default_palette[16] = {
@@ -2336,6 +2749,9 @@ gut_open(const struct gut_desc *desc)
         }
         w->owns_video = 1;
     }
+    if (!d.no_gamepad && !SDL_WasInit(SDL_INIT_GAMEPAD) &&
+        SDL_InitSubSystem(SDL_INIT_GAMEPAD))
+        w->owns_gamepad = 1;    /* failure just means no pads */
     if (gut_create_context(w, d.title ? d.title : "guterm",
                            cols * w->cell_w, rows * w->cell_h,
                            d.fixed_size) != 0 ||
@@ -2395,9 +2811,168 @@ gut_close(gut_window *w)
     free(w->event_text);
     free(w->preedit);
     free(w->verts);
+    for (int i = 0; i < GUT_MAX_PADS; i++)
+        if (w->pads[i])
+            SDL_CloseGamepad(w->pads[i]);
+    if (w->owns_gamepad)
+        SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
     if (w->owns_video)
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
     free(w);
+}
+
+void
+gut_set_selection(gut_window *w, const struct gut_sel *sel)
+{
+    if (sel)
+        w->sel = *sel;
+    else
+        gut_sel_clear(&w->sel);
+}
+
+int
+gut_pad_get(const gut_window *w, int slot, struct gut_pad *out)
+{
+    if (slot < 0 || slot >= GUT_MAX_PADS) {
+        if (out)
+            memset(out, 0, sizeof(*out));
+        return 0;
+    }
+    if (out)
+        *out = w->pad_state[slot];
+    return w->pad_state[slot].connected;
+}
+
+int
+gut_pad_rumble(gut_window *w, int slot, uint16_t low, uint16_t high,
+               uint32_t ms)
+{
+    if (slot < 0 || slot >= GUT_MAX_PADS || !w->pads[slot])
+        return -1;
+    return SDL_RumbleGamepad(w->pads[slot], low, high, ms) ? 0 : -1;
+}
+
+/* ---- game controllers ---- */
+
+static int
+gut_pad_slot(const gut_window *w, SDL_JoystickID id)
+{
+    for (int i = 0; i < GUT_MAX_PADS; i++)
+        if (w->pads[i] && w->pad_ids[i] == id)
+            return i;
+    return -1;
+}
+
+static int
+gut_pad_button_from_sdl(int b)
+{
+    switch (b) {
+    case SDL_GAMEPAD_BUTTON_SOUTH:          return GUT_PAD_A;
+    case SDL_GAMEPAD_BUTTON_EAST:           return GUT_PAD_B;
+    case SDL_GAMEPAD_BUTTON_WEST:           return GUT_PAD_X;
+    case SDL_GAMEPAD_BUTTON_NORTH:          return GUT_PAD_Y;
+    case SDL_GAMEPAD_BUTTON_BACK:           return GUT_PAD_BACK;
+    case SDL_GAMEPAD_BUTTON_GUIDE:          return GUT_PAD_GUIDE;
+    case SDL_GAMEPAD_BUTTON_START:          return GUT_PAD_START;
+    case SDL_GAMEPAD_BUTTON_LEFT_STICK:     return GUT_PAD_LSTICK;
+    case SDL_GAMEPAD_BUTTON_RIGHT_STICK:    return GUT_PAD_RSTICK;
+    case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER:  return GUT_PAD_LSHOULDER;
+    case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: return GUT_PAD_RSHOULDER;
+    case SDL_GAMEPAD_BUTTON_DPAD_UP:        return GUT_PAD_UP;
+    case SDL_GAMEPAD_BUTTON_DPAD_DOWN:      return GUT_PAD_DOWN;
+    case SDL_GAMEPAD_BUTTON_DPAD_LEFT:      return GUT_PAD_LEFT;
+    case SDL_GAMEPAD_BUTTON_DPAD_RIGHT:     return GUT_PAD_RIGHT;
+    default:                                return -1;
+    }
+}
+
+static int
+gut_pad_axis_from_sdl(int a)
+{
+    switch (a) {
+    case SDL_GAMEPAD_AXIS_LEFTX:         return GUT_PAD_AXIS_LX;
+    case SDL_GAMEPAD_AXIS_LEFTY:         return GUT_PAD_AXIS_LY;
+    case SDL_GAMEPAD_AXIS_RIGHTX:        return GUT_PAD_AXIS_RX;
+    case SDL_GAMEPAD_AXIS_RIGHTY:        return GUT_PAD_AXIS_RY;
+    case SDL_GAMEPAD_AXIS_LEFT_TRIGGER:  return GUT_PAD_AXIS_LT;
+    case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER: return GUT_PAD_AXIS_RT;
+    default:                             return -1;
+    }
+}
+
+/* Translate a gamepad event; returns 1 when ev was filled. */
+static int
+gut_translate_pad(gut_window *w, const SDL_Event *e, struct gut_event *ev)
+{
+    int slot;
+
+    switch (e->type) {
+    case SDL_EVENT_GAMEPAD_ADDED: {
+        SDL_Gamepad *pad;
+        const char *name;
+
+        if (gut_pad_slot(w, e->gdevice.which) >= 0)
+            return 0;
+        for (slot = 0; slot < GUT_MAX_PADS && w->pads[slot]; slot++)
+            ;
+        if (slot == GUT_MAX_PADS)
+            return 0;
+        pad = SDL_OpenGamepad(e->gdevice.which);
+        if (!pad)
+            return 0;
+        w->pads[slot] = pad;
+        w->pad_ids[slot] = e->gdevice.which;
+        memset(&w->pad_state[slot], 0, sizeof(w->pad_state[slot]));
+        w->pad_state[slot].connected = 1;
+        name = SDL_GetGamepadName(pad);
+        snprintf(w->pad_state[slot].name, sizeof(w->pad_state[slot].name),
+                 "%s", name ? name : "");
+        ev->type = GUT_EVENT_PAD_ADDED;
+        ev->pad = slot;
+        return 1;
+    }
+    case SDL_EVENT_GAMEPAD_REMOVED:
+        slot = gut_pad_slot(w, e->gdevice.which);
+        if (slot < 0)
+            return 0;
+        SDL_CloseGamepad(w->pads[slot]);
+        w->pads[slot] = NULL;
+        memset(&w->pad_state[slot], 0, sizeof(w->pad_state[slot]));
+        ev->type = GUT_EVENT_PAD_REMOVED;
+        ev->pad = slot;
+        return 1;
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+    case SDL_EVENT_GAMEPAD_BUTTON_UP: {
+        int button = gut_pad_button_from_sdl(e->gbutton.button);
+
+        slot = gut_pad_slot(w, e->gbutton.which);
+        if (slot < 0 || button < 0)
+            return 0;
+        if (e->gbutton.down)
+            w->pad_state[slot].buttons |= 1u << button;
+        else
+            w->pad_state[slot].buttons &= ~(1u << button);
+        ev->type = e->gbutton.down ? GUT_EVENT_PAD_DOWN : GUT_EVENT_PAD_UP;
+        ev->pad = slot;
+        ev->button = button;
+        return 1;
+    }
+    case SDL_EVENT_GAMEPAD_AXIS_MOTION: {
+        int axis = gut_pad_axis_from_sdl(e->gaxis.axis);
+
+        slot = gut_pad_slot(w, e->gaxis.which);
+        if (slot < 0 || axis < 0)
+            return 0;
+        w->pad_state[slot].axes[axis] = e->gaxis.value;
+        ev->type = GUT_EVENT_PAD_AXIS;
+        ev->pad = slot;
+        ev->axis = axis;
+        ev->value = e->gaxis.value;
+        return 1;
+    }
+    default:
+        return 0;
+    }
 }
 
 void
@@ -2612,6 +3187,12 @@ gut_draw_cell(gut_window *w, const struct gut_cell *c, int row, int col,
     int slot;
 
     gut_cell_colors(w, c, &fg, &bg);
+    if (gut_sel_contains(&w->sel, row, col)) {
+        uint32_t t = fg;
+
+        fg = bg;
+        bg = t;
+    }
     if (cursor && w->focused && c->width != 0) {
         /* a block cursor inverts the cell; the other shapes overlay */
         if (cursor == GUT_CURSOR_BLOCK + 1) {
@@ -2738,6 +3319,8 @@ gut_present(gut_window *w, struct gut_buf *b)
             if (cell->width == 0)
                 continue;
             gut_cell_colors(w, cell, &fg, &bg);
+            if (gut_sel_contains(&w->sel, r, c))
+                bg = fg;
             if (bg == w->def_bg)
                 continue;
             gut_rect(w, (float)(c * w->cell_w), (float)(r * w->cell_h),
@@ -2993,6 +3576,7 @@ gut_translate(gut_window *w, const SDL_Event *e, struct gut_event *ev)
                    : e->button.button == SDL_BUTTON_MIDDLE ? GUT_BUTTON_MIDDLE
                    : e->button.button == SDL_BUTTON_RIGHT ? GUT_BUTTON_RIGHT
                    : 0;
+        ev->clicks = e->button.clicks;
         if (w->paste_keys && ev->type == GUT_EVENT_MOUSE_DOWN &&
             ev->button == GUT_BUTTON_MIDDLE &&
             gut_paste_event(w, ev, gut_primary_get(w), 1))
@@ -3004,6 +3588,12 @@ gut_translate(gut_window *w, const SDL_Event *e, struct gut_event *ev)
         ev->dx = (int)e->wheel.x;
         ev->dy = (int)e->wheel.y;
         return 1;
+    case SDL_EVENT_GAMEPAD_ADDED:
+    case SDL_EVENT_GAMEPAD_REMOVED:
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+    case SDL_EVENT_GAMEPAD_BUTTON_UP:
+    case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+        return gut_translate_pad(w, e, ev);
     default:
         return 0;
     }
@@ -3669,8 +4259,12 @@ gut_vt_decset(struct gut_vt *vt, int n, int on)
     case 1002:
     case 1003:
         vt->mouse_mode = on ? n : 0;
+        vt->mouse_row = -1;
+        vt->mouse_col = -1;
         bit = GUT_VT_MODE_MOUSE;
         break;
+    case 1004: bit = GUT_VT_MODE_FOCUS; break;
+    case 1006: bit = GUT_VT_MODE_MOUSE_SGR; break;
     case 2004: bit = GUT_VT_MODE_BRACKETPASTE; break;
     default:
         return;
@@ -4123,6 +4717,8 @@ gut_vt_reset(struct gut_vt *vt)
     b = vt->buf;
     vt->modes = GUT_VT_MODE_AUTOWRAP;
     vt->mouse_mode = 0;
+    vt->mouse_row = -1;
+    vt->mouse_col = -1;
     vt->attrs = 0;
     vt->fg = gut_color_default();
     vt->bg = gut_color_default();
@@ -4344,7 +4940,59 @@ gut_vt_encode_flags(const struct gut_vt *vt)
         flags |= GUT_ENC_APP_CURSOR;
     if (vt->modes & GUT_VT_MODE_BRACKETPASTE)
         flags |= GUT_ENC_BRACKET_PASTE;
+    if (vt->modes & GUT_VT_MODE_MOUSE) {
+        flags |= vt->mouse_mode == 1003 ? GUT_ENC_MOUSE_ANY
+               : vt->mouse_mode == 1002 ? GUT_ENC_MOUSE_DRAG
+               : GUT_ENC_MOUSE_BTN;
+    }
+    if (vt->modes & GUT_VT_MODE_MOUSE_SGR)
+        flags |= GUT_ENC_MOUSE_SGR;
+    if (vt->modes & GUT_VT_MODE_FOCUS)
+        flags |= GUT_ENC_FOCUS;
     return flags;
+}
+
+size_t
+gut_vt_mouse(struct gut_vt *vt, const struct gut_event *ev, char *out,
+             size_t n)
+{
+    int flags = gut_vt_encode_flags(vt);
+
+    if (n)
+        out[0] = '\0';
+    if (ev->type == GUT_EVENT_FOCUS_IN || ev->type == GUT_EVENT_FOCUS_OUT)
+        return gut_encode_event(ev, out, n, flags);
+    if (ev->type < GUT_EVENT_MOUSE_DOWN || ev->type > GUT_EVENT_MOUSE_WHEEL)
+        return 0;
+    if (!(vt->modes & GUT_VT_MODE_MOUSE)) {
+        /* alternate scroll: the wheel drives full screen programs */
+        if (ev->type == GUT_EVENT_MOUSE_WHEEL && ev->dy != 0 &&
+            (vt->modes & GUT_VT_MODE_ALTSCREEN)) {
+            struct gut_event key;
+            struct gut_sink s = { out, n, 0 };
+            char one[16];
+            size_t len;
+
+            memset(&key, 0, sizeof(key));
+            key.type = GUT_EVENT_KEY;
+            key.key = ev->dy > 0 ? GUT_KEY_UP : GUT_KEY_DOWN;
+            len = gut_encode_event(&key, one, sizeof(one), flags);
+            for (int i = 0; i < 3 * (ev->dy > 0 ? ev->dy : -ev->dy); i++)
+                gut_sink_put(&s, one, len);
+            gut_sink_end(&s);
+            return s.len;
+        }
+        return 0;
+    }
+    if (ev->mods & GUT_MOD_SHIFT)
+        return 0;
+    if (ev->type == GUT_EVENT_MOUSE_MOVE) {
+        if (ev->row == vt->mouse_row && ev->col == vt->mouse_col)
+            return 0;
+        vt->mouse_row = ev->row;
+        vt->mouse_col = ev->col;
+    }
+    return gut_encode_event(ev, out, n, flags);
 }
 
 void

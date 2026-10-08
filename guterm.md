@@ -21,10 +21,11 @@ This manual covers version 0.1.0 of `guterm.h`.
 8. Encoding events for terminal programs
 9. Clipboard, selection and paste
 10. Input methods
-11. The VT layer
-12. Threads, blocking and other event sources
-13. Portability notes
-14. Reference tables
+11. Game controllers
+12. The VT layer
+13. Threads, blocking and other event sources
+14. Portability notes
+15. Reference tables
 
 ## 1. Getting started
 
@@ -355,6 +356,7 @@ struct gut_desc {
     int no_paste_keys;              /* 1 delivers paste chords as keys */
     int no_compose_overlay;         /* 1 leaves IME preedit drawing to
                                        the program */
+    int no_gamepad;                 /* 1 skips game controller support */
 };
 
 gut_window *gut_open(const struct gut_desc *desc);
@@ -458,9 +460,13 @@ struct gut_event {
     int primary;        /* PASTE: 1 from the primary selection */
     int col, row;       /* mouse position in cells */
     int x, y;           /* mouse position in pixels */
-    int button;         /* enum gut_button */
+    int button;         /* enum gut_button, or enum gut_pad_button */
+    int clicks;         /* MOUSE_DOWN: 1 single, 2 double, 3 triple */
     int dx, dy;         /* wheel notches */
     int cols, rows;     /* GUT_EVENT_RESIZE */
+    int pad;            /* PAD events: controller slot 0 to 3 */
+    int axis;           /* PAD_AXIS: enum gut_pad_axis */
+    int value;          /* PAD_AXIS: -32768 to 32767 */
 };
 ```
 
@@ -475,10 +481,13 @@ fields are meaningful per type:
 | `GUT_EVENT_PASTE` | `data`, `len`, `primary`, `col`, `row` | The user pasted. |
 | `GUT_EVENT_RESIZE` | `cols`, `rows` | The grid now fits this many cells. |
 | `GUT_EVENT_QUIT` | | The window was asked to close. |
-| `GUT_EVENT_MOUSE_DOWN`, `GUT_EVENT_MOUSE_UP` | `col`, `row`, `x`, `y`, `button` | A button changed. |
+| `GUT_EVENT_MOUSE_DOWN`, `GUT_EVENT_MOUSE_UP` | `col`, `row`, `x`, `y`, `button`, `clicks` | A button changed. `clicks` counts a double or triple click on the way down. |
 | `GUT_EVENT_MOUSE_MOVE` | `col`, `row`, `x`, `y`, `button` | The pointer moved. `button` is the first button held, or 0. |
 | `GUT_EVENT_MOUSE_WHEEL` | `col`, `row`, `x`, `y`, `dx`, `dy` | The wheel turned. Positive `dy` is away from the user. |
 | `GUT_EVENT_FOCUS_IN`, `GUT_EVENT_FOCUS_OUT` | | Keyboard focus changed. |
+| `GUT_EVENT_PAD_ADDED`, `GUT_EVENT_PAD_REMOVED` | `pad` | A game controller took or left a slot. |
+| `GUT_EVENT_PAD_DOWN`, `GUT_EVENT_PAD_UP` | `pad`, `button` | A controller button changed; `button` is an `enum gut_pad_button`. |
+| `GUT_EVENT_PAD_AXIS` | `pad`, `axis`, `value` | A stick or trigger moved. |
 
 ### Keys versus text
 
@@ -535,6 +544,8 @@ program's own key decoder then works unchanged.
 | `GUT_EVENT_KEY`, printable with Alt | ESC then the character. |
 | `GUT_EVENT_KEY`, printable, no Ctrl or Alt | Nothing; the TEXT event carries it. |
 | `GUT_EVENT_PASTE` | The text with newlines turned into carriage returns, as a terminal sends Enter. With `GUT_ENC_BRACKET_PASTE`, wrapped in `CSI 200 ~` and `CSI 201 ~`. |
+| Mouse events | An xterm mouse report when a `GUT_ENC_MOUSE_*` flag asks for that kind of event, see below. Nothing otherwise. |
+| `GUT_EVENT_FOCUS_IN`, `GUT_EVENT_FOCUS_OUT` | `CSI I` and `CSI O` with `GUT_ENC_FOCUS`. Nothing otherwise. |
 | Anything else | Nothing. |
 
 Flags:
@@ -544,9 +555,32 @@ Flags:
 | `GUT_ENC_APP_CURSOR` | Cursor keys send SS3 sequences, the DECCKM application mode. |
 | `GUT_ENC_BS_BS` | Backspace sends BS (0x08) instead of DEL (0x7F). |
 | `GUT_ENC_BRACKET_PASTE` | Bracketed paste, as above. |
+| `GUT_ENC_MOUSE_BTN` | Mode 1000: report presses, releases and the wheel. |
+| `GUT_ENC_MOUSE_DRAG` | Mode 1002: also motion while a button is held. |
+| `GUT_ENC_MOUSE_ANY` | Mode 1003: all motion. |
+| `GUT_ENC_MOUSE_SGR` | Mode 1006: the `CSI < b ; x ; y M` form, with `m` for a release, instead of the three byte `CSI M` form. |
+| `GUT_ENC_FOCUS` | Mode 1004: focus reports. |
 
-The return value and `out` follow snprintf sizing. Sixteen bytes cover
-every key; a paste needs `ev->len + 16`. When using the VT layer,
+### Mouse reports
+
+The encoder produces what xterm sends. The button code is 0, 1 and 2 for
+left, middle and right, 64 and 65 for the wheel away from and towards
+the user, 66 and 67 for a horizontal wheel, plus 32 for motion, 4 for
+Shift, 8 for Alt and 16 for Ctrl. Coordinates are 1 based. The legacy
+form adds 32 to each value and sends them as single bytes, so it cannot
+express a column or row above 223; such an event encodes to nothing.
+A release in the legacy form uses button code 3. The SGR form has no
+such limit and names the released button.
+
+Without the VT layer, a host passes the flags that match the modes the
+program turned on. The encoder itself is stateless: it reports every
+motion event it is given, while xterm reports one per cell. The VT
+layer's `gut_vt_mouse()` in section 12 adds that and the other
+conventions.
+
+The return value and `out` follow snprintf sizing. Thirty two bytes
+cover every key and mouse report; a paste needs `ev->len + 16`. When
+using the VT layer,
 `gut_vt_encode_flags()` returns the flags that match the modes the
 program has set, so the right thing happens without the caller tracking
 modes:
@@ -612,6 +646,71 @@ that bind those keys themselves and call the getters.
 Copy is the program's business, since only it knows what is selected.
 The pieces are `gut_buf_copy_text()` to turn cells into text and
 `gut_clipboard_set()` to publish it. There is no built in copy chord.
+For the common case of a mouse driven selection over the buffer, the
+selection helper below does the tracking.
+
+### Selection
+
+```c
+struct gut_sel {
+    int active;             /* a selection exists */
+    int dragging;           /* the button is still held */
+    int mode;               /* GUT_COPY_STREAM or GUT_COPY_RECT */
+    int unit;               /* GUT_SEL_CELL, GUT_SEL_WORD, GUT_SEL_LINE */
+    int anchor_row, anchor_col;
+    int row0, col0;         /* normalised: start, inclusive */
+    int row1, col1;         /* end, inclusive */
+};
+
+void   gut_sel_clear(struct gut_sel *s);
+void   gut_sel_begin(struct gut_sel *s, const struct gut_buf *b,
+                     int row, int col, int mode, int unit);
+void   gut_sel_extend(struct gut_sel *s, const struct gut_buf *b,
+                      int row, int col);
+int    gut_sel_mouse(struct gut_sel *s, const struct gut_buf *b,
+                     const struct gut_event *ev);
+int    gut_sel_contains(const struct gut_sel *s, int row, int col);
+size_t gut_sel_text(const struct gut_sel *s, const struct gut_buf *b,
+                    char *out, size_t n);
+void   gut_set_selection(gut_window *w, const struct gut_sel *sel);
+```
+
+`gut_sel` is a plain struct the program owns, zeroed by
+`gut_sel_clear`. It lives in the buffer layer and needs no window.
+
+`gut_sel_mouse` consumes mouse events and returns 1 when the selection
+changed, which is the cue to present and, on a release, to publish the
+text. The gestures are the usual ones:
+
+- Left press and drag selects cells in reading order. A press that is
+  released without moving clears the selection.
+- A double click selects a word, a run of non-blank cells, and dragging
+  extends by whole words. A triple click selects the line and dragging
+  extends by lines. The window counts the clicks in `ev->clicks`.
+- Shift+click moves the nearer end of an existing selection to the
+  click.
+- Alt+drag selects a rectangle, `GUT_COPY_RECT`.
+- A wide character is taken whole when either of its cells is at an
+  end.
+- Other buttons and the wheel are ignored and return 0, so the program
+  can use them.
+
+`gut_sel_begin` and `gut_sel_extend` do the same without a mouse, for
+keyboard selection. Points outside the buffer clamp to its edge.
+
+`gut_sel_contains` answers for one cell, for programs that draw the
+selection themselves. `gut_sel_text` gives the selected text with
+`gut_buf_copy_text` sizing, and 0 when there is no selection.
+
+`gut_set_selection` hands the window a copy to highlight on the next
+`gut_present`, drawn with each cell's colors swapped. NULL clears it.
+The highlight is purely visual; the buffer is not touched.
+
+The selection is in buffer coordinates. It does not follow the content
+when the buffer scrolls or the VT view moves, so a terminal host clears
+it when it sends keys to the child, as `examples/term.c` does. On X11
+and Wayland the host also calls `gut_primary_set` with the text when a
+drag ends.
 
 ## 10. Input methods
 
@@ -675,7 +774,54 @@ composing. A program that follows the rule in section 7, acting on text
 events for printable input and on key events only for specials and
 modifier combinations, is unaffected.
 
-## 11. The VT layer
+## 11. Game controllers
+
+```c
+#define GUT_MAX_PADS 4
+
+struct gut_pad {
+    int connected;
+    char name[64];
+    uint32_t buttons;       /* bit (1 << gut_pad_button) per held button */
+    int16_t axes[GUT_PAD_AXIS_COUNT];
+};
+
+int gut_pad_get(const gut_window *w, int slot, struct gut_pad *out);
+int gut_pad_rumble(gut_window *w, int slot, uint16_t low, uint16_t high,
+                   uint32_t ms);
+```
+
+Up to four controllers are tracked in slots 0 to 3. A controller takes
+the lowest free slot when it connects and frees it when it leaves; a
+fifth controller is ignored until a slot opens. Every controller is
+presented in the Xbox layout SDL maps it to, so a PlayStation cross is
+`GUT_PAD_A` and its circle is `GUT_PAD_B`.
+
+Buttons: `GUT_PAD_A`, `B`, `X`, `Y`, `BACK`, `GUIDE`, `START`,
+`LSTICK`, `RSTICK`, `LSHOULDER`, `RSHOULDER` and the directional pad
+`UP`, `DOWN`, `LEFT`, `RIGHT`. Axes: `GUT_PAD_AXIS_LX`, `LY`, `RX`,
+`RY` for the sticks, from -32768 at the left or top to 32767, and
+`GUT_PAD_AXIS_LT`, `RT` for the triggers, from 0 released to 32767.
+Values are raw; a program applies its own dead zone.
+
+Changes arrive as events: `GUT_EVENT_PAD_ADDED` and
+`GUT_EVENT_PAD_REMOVED` with `pad`, `GUT_EVENT_PAD_DOWN` and
+`GUT_EVENT_PAD_UP` with `pad` and `button`, and `GUT_EVENT_PAD_AXIS`
+with `pad`, `axis` and `value`. A stick in motion produces many axis
+events. A program that would rather sample reads the whole state with
+`gut_pad_get`, which returns 1 while a controller is connected in that
+slot. Controllers already plugged in when the window opens produce
+`GUT_EVENT_PAD_ADDED` from the first polls.
+
+`gut_pad_rumble` vibrates for `ms` milliseconds with the low and high
+frequency motors at 0 to 65535. It returns -1 for an empty slot or a
+controller without rumble.
+
+Setting `gut_desc.no_gamepad` leaves the SDL gamepad subsystem
+uninitialised, for programs that never want controller events or that
+manage SDL gamepads themselves.
+
+## 12. The VT layer
 
 The VT layer is a terminal emulator that writes into a `gut_buf`. A
 program that already produces terminal output, or that hosts a child
@@ -775,9 +921,9 @@ hidden, strike, the 8 and 16 color sets, 256 colors and 24 bit color.
 Modes: DECSTBM scroll region, DECOM origin mode, DECAWM auto wrap, IRM
 insert mode, DECTCEM cursor visibility, DECSCUSR cursor shape, DECCKM
 application cursor keys, DECKPAM application keypad, bracketed paste,
-mouse tracking modes 1000, 1002 and 1003 recorded as a mode flag, and
-the alternate screen via 47, 1047 and 1049 with the primary screen
-parked and restored.
+mouse tracking modes 1000, 1002 and 1003 with the SGR encoding 1006,
+focus reporting 1004, and the alternate screen via 47, 1047 and 1049
+with the primary screen parked and restored.
 
 Tabs: HTS, TBC for one stop and for all.
 
@@ -788,7 +934,7 @@ OSC 0 and 2 set the title. Other OSC, all DCS, APC, PM and SOS strings,
 and unknown CSI and ESC sequences are consumed and ignored, so a program
 that emits sequences the emulator does not know still displays sanely.
 
-Not implemented: mouse report generation, OSC 52 clipboard,
+Not implemented: OSC 52 clipboard,
 kitty keyboard protocol, XTWINOPS, character set designations other than
 ASCII and line drawing, and combining characters, which are dropped.
 
@@ -818,9 +964,51 @@ does nothing by itself.
 
 `gut_vt_modes()` returns the current mode flags, `GUT_VT_MODE_*`, for a
 host that wants to know for instance whether the program has enabled
-mouse tracking. `gut_vt_encode_flags()` maps the modes that affect key
-encoding, application cursor keys and bracketed paste, onto
-`gut_encode_event()` flags.
+mouse tracking. `gut_vt_encode_flags()` maps the modes that affect
+encoding, application cursor keys, bracketed paste, mouse tracking and
+focus reporting, onto `gut_encode_event()` flags.
+
+### Mouse reporting
+
+```c
+size_t gut_vt_mouse(struct gut_vt *vt, const struct gut_event *ev,
+                    char *out, size_t n);
+```
+
+A host that forwards mouse and focus events through `gut_encode_event`
+with `gut_vt_encode_flags` already gets correct reports. `gut_vt_mouse`
+wraps that with the conventions xterm users expect, so the host does
+not need to know the protocol at all. For a mouse or focus event it
+returns the bytes to send, with `gut_encode_event` sizing, or 0 when the
+event is the host's to use, for selection or scrolling:
+
+- When the program has not enabled tracking, every mouse event is the
+  host's. The exception is the wheel on the alternate screen, which
+  becomes three Up or Down key presses per notch, so a pager or editor
+  scrolls under the wheel the way it does in xterm.
+- With tracking on, a Shift modifier bypasses it, so the user can still
+  select text in a program that owns the mouse.
+- Motion is reported once per cell, as xterm does, however often the
+  pointer moves inside a cell.
+- Focus events are reported when the program asked with mode 1004.
+
+A host therefore handles the four mouse event types and the two focus
+events with one call, and falls through to its own handling on 0:
+
+```c
+char bytes[64];
+size_t n = gut_vt_mouse(&vt, &ev, bytes, sizeof(bytes));
+
+if (n > 0)
+    write(pty, bytes, n);
+else if (ev.type == GUT_EVENT_MOUSE_WHEEL)
+    gut_vt_scroll_view(&vt, ev.dy * 3);
+else if (gut_sel_mouse(&sel, &buf, &ev))
+    gut_set_selection(w, &sel);
+```
+
+The call keeps the last reported cell in the emulator, so it must be
+made once per event.
 
 ### A terminal host
 
@@ -838,9 +1026,13 @@ The shape of a program that runs a shell, from `examples/term.c`:
    terminal's window size.
 5. Shift+PageUp, Shift+PageDown and the wheel move the view with
    `gut_vt_scroll_view()`; any key, text or paste sent to the child
-   first returns the view to the live screen.
+   first returns the view to the live screen and clears the selection.
+6. Mouse events go through `gut_vt_mouse()` first. What comes back as
+   the host's drives the selection; a finished drag sets the primary
+   selection and Ctrl+Shift+C copies to the clipboard. Focus events go
+   through it too.
 
-## 12. Threads, blocking and other event sources
+## 13. Threads, blocking and other event sources
 
 guterm is single threaded and not thread safe. All calls on a window come
 from the thread that opened it, which on macOS must be the main thread.
@@ -867,7 +1059,7 @@ arrive faster than that. Coalescing, by draining pending events with a
 zero timeout before presenting, keeps it responsive under a flood of
 input.
 
-## 13. Portability notes
+## 14. Portability notes
 
 **Linux.** The native path. SDL creates an EGL context with OpenGL ES
 2.0, which exists on every Mesa driver and on Raspberry Pi 3 and later.
@@ -895,7 +1087,7 @@ expects xterm keys needs no changes to its protocol handling: feed its
 output to the VT layer, send it the encoder's bytes, and give it an
 `xterm-256color` terminfo entry.
 
-## 14. Reference tables
+## 15. Reference tables
 
 ### Default palette
 
@@ -948,6 +1140,8 @@ Super is the Windows key or Command key.
 | `GUT_VT_MODE_APP_CURSOR` | DECSET 1 |
 | `GUT_VT_MODE_APP_KEYPAD` | ESC = |
 | `GUT_VT_MODE_MOUSE` | DECSET 1000, 1002, 1003; the specific mode is in `vt->mouse_mode` |
+| `GUT_VT_MODE_MOUSE_SGR` | DECSET 1006 |
+| `GUT_VT_MODE_FOCUS` | DECSET 1004 |
 
 ### Functions by layer
 
@@ -957,16 +1151,20 @@ Buffer, no dependencies: `gut_color_default`, `gut_color_indexed`,
 `gut_buf_clear_rows`, `gut_buf_put`, `gut_buf_text`, `gut_buf_fill`,
 `gut_buf_scroll`, `gut_buf_dirty_all`, `gut_buf_copy_text`,
 `gut_utf8_decode`, `gut_utf8_encode`, `gut_rune_width`,
-`gut_font_default`, `gut_font_lookup`, `gut_encode_event`.
+`gut_font_default`, `gut_font_lookup`, `gut_encode_event`,
+`gut_sel_clear`, `gut_sel_begin`, `gut_sel_extend`, `gut_sel_mouse`,
+`gut_sel_contains`, `gut_sel_text`.
 
 Window, needs SDL3: `gut_open`, `gut_close`, `gut_error`, `gut_present`,
 `gut_poll`, `gut_grid_size`, `gut_set_grid_size`, `gut_set_title`,
 `gut_set_defaults`, `gut_set_palette`, `gut_clipboard_get`,
 `gut_clipboard_set`, `gut_primary_get`, `gut_primary_set`,
-`gut_set_text_input`, `gut_set_compose_overlay`, `gut_ticks`.
+`gut_set_text_input`, `gut_set_compose_overlay`, `gut_set_selection`,
+`gut_pad_get`, `gut_pad_rumble`, `gut_ticks`.
 
 VT, no dependencies: `gut_vt_init`, `gut_vt_free`, `gut_vt_reset`,
 `gut_vt_feed`, `gut_vt_resize`, `gut_vt_modes`, `gut_vt_encode_flags`,
+`gut_vt_mouse`,
 `gut_vt_set_scrollback`, `gut_vt_scrollback_lines`,
 `gut_vt_clear_scrollback`, `gut_vt_set_view`, `gut_vt_scroll_view`,
 `gut_vt_view_offset`, `gut_vt_set_reply`, `gut_vt_set_title_cb`,

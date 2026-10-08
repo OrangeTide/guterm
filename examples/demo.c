@@ -103,6 +103,7 @@ main(int argc, char **argv)
     int running = 1;
     int echo_row, echo_col;
     char status[128];
+    struct gut_sel sel;
 
     desc.title = "guterm demo";
     desc.cols = 100;
@@ -116,6 +117,7 @@ main(int argc, char **argv)
     }
     gut_buf_init(&buf, desc.rows, desc.cols);
     draw_static(&buf);
+    gut_sel_clear(&sel);
     echo_row = 20;
     echo_col = 2;
     buf.cursor_row = echo_row;
@@ -134,6 +136,15 @@ main(int argc, char **argv)
         case GUT_EVENT_KEY:
             if (ev.key == GUT_KEY_ESCAPE)
                 running = 0;
+            else if (ev.key == 'c' &&
+                     ev.mods == (GUT_MOD_CTRL | GUT_MOD_SHIFT)) {
+                char text[4096];
+
+                if (gut_sel_text(&sel, &buf, text, sizeof(text)) > 0)
+                    gut_clipboard_set(w, text);
+                snprintf(status, sizeof(status), "copied \"%s\"", text);
+                break;
+            }
             else if (ev.key == GUT_KEY_F1)
                 buf.cursor_shape = GUT_CURSOR_BLOCK;
             else if (ev.key == GUT_KEY_F2)
@@ -182,10 +193,21 @@ main(int argc, char **argv)
         case GUT_EVENT_MOUSE_MOVE:
         case GUT_EVENT_MOUSE_DOWN:
         case GUT_EVENT_MOUSE_UP:
-            snprintf(status, sizeof(status), "mouse %s col %d row %d btn %d",
+            if (gut_sel_mouse(&sel, &buf, &ev)) {
+                gut_set_selection(w, &sel);
+                if (ev.type == GUT_EVENT_MOUSE_UP) {
+                    char text[4096];
+
+                    if (gut_sel_text(&sel, &buf, text, sizeof(text)) > 0)
+                        gut_primary_set(w, text);
+                }
+            }
+            snprintf(status, sizeof(status),
+                     "mouse %s col %d row %d btn %d clicks %d%s",
                      ev.type == GUT_EVENT_MOUSE_DOWN ? "down"
                      : ev.type == GUT_EVENT_MOUSE_UP ? "up" : "move",
-                     ev.col, ev.row, ev.button);
+                     ev.col, ev.row, ev.button, ev.clicks,
+                     sel.active ? " [selection]" : "");
             break;
         case GUT_EVENT_MOUSE_WHEEL:
             snprintf(status, sizeof(status), "wheel dx %d dy %d", ev.dx,
@@ -201,6 +223,27 @@ main(int argc, char **argv)
         case GUT_EVENT_COMPOSE:
             snprintf(status, sizeof(status), "compose \"%s\" caret %d",
                      ev.data, ev.cursor);
+            break;
+        case GUT_EVENT_PAD_ADDED:
+        case GUT_EVENT_PAD_REMOVED: {
+            struct gut_pad pad;
+
+            gut_pad_get(w, ev.pad, &pad);
+            snprintf(status, sizeof(status), "pad %d %s %s", ev.pad,
+                     ev.type == GUT_EVENT_PAD_ADDED ? "added" : "removed",
+                     pad.name);
+            if (ev.type == GUT_EVENT_PAD_ADDED)
+                gut_pad_rumble(w, ev.pad, 0x4000, 0x4000, 200);
+            break;
+        }
+        case GUT_EVENT_PAD_DOWN:
+        case GUT_EVENT_PAD_UP:
+            snprintf(status, sizeof(status), "pad %d button %d %s", ev.pad,
+                     ev.button, ev.type == GUT_EVENT_PAD_DOWN ? "down" : "up");
+            break;
+        case GUT_EVENT_PAD_AXIS:
+            snprintf(status, sizeof(status), "pad %d axis %d %d", ev.pad,
+                     ev.axis, ev.value);
             break;
         default:
             status[0] = '\0';

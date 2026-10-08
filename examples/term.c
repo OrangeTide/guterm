@@ -3,10 +3,11 @@
 /*
  * POSIX only. Spawns $SHELL (or /bin/sh) on a pseudo terminal, feeds its
  * output through the VT layer and sends encoded key events back. It is a
- * demonstration of the VT layer, not a complete terminal: there is no
- * selection or mouse reporting. Shift+PageUp, Shift+PageDown and the
- * wheel scroll back; any key sent to the shell returns to the live
- * screen.
+ * demonstration of the VT layer, not a complete terminal. Shift+PageUp,
+ * Shift+PageDown and the wheel scroll back; any key sent to the shell
+ * returns to the live screen. Mouse events go to the program when it
+ * asked for them, otherwise the left button selects, Ctrl+Shift+C
+ * copies, and a selection is also the primary selection.
  */
 
 #define GUTERM_IMPLEMENTATION
@@ -36,6 +37,7 @@ struct app {
     gut_window *w;
     struct gut_vt vt;
     struct gut_buf buf;
+    struct gut_sel sel;
     int master;
     pid_t child;
 };
@@ -145,6 +147,49 @@ send_event(struct app *a, const struct gut_event *ev)
 }
 
 static void
+copy_selection(struct app *a, int primary)
+{
+    char *text;
+    size_t n = gut_sel_text(&a->sel, &a->buf, NULL, 0);
+
+    if (n == 0)
+        return;
+    text = malloc(n + 1);
+    if (!text)
+        return;
+    gut_sel_text(&a->sel, &a->buf, text, n + 1);
+    if (primary)
+        gut_primary_set(a->w, text);
+    else
+        gut_clipboard_set(a->w, text);
+    free(text);
+}
+
+/* The program gets the mouse when it asked for it; otherwise it drives
+ * the selection. */
+static void
+mouse_event(struct app *a, const struct gut_event *ev)
+{
+    char bytes[64];
+    size_t n = gut_vt_mouse(&a->vt, ev, bytes, sizeof(bytes));
+
+    if (n > 0) {
+        if (n < sizeof(bytes))
+            pty_write(a, bytes, n);
+        return;
+    }
+    if (ev->type == GUT_EVENT_MOUSE_WHEEL) {
+        gut_vt_scroll_view(&a->vt, ev->dy * 3);
+        return;
+    }
+    if (gut_sel_mouse(&a->sel, &a->buf, ev)) {
+        gut_set_selection(a->w, &a->sel);
+        if (ev->type == GUT_EVENT_MOUSE_UP)
+            copy_selection(a, 1);
+    }
+}
+
+static void
 handle_event(struct app *a, const struct gut_event *ev, int *running)
 {
     switch (ev->type) {
@@ -155,6 +200,10 @@ handle_event(struct app *a, const struct gut_event *ev, int *running)
         resize(a, ev->rows, ev->cols);
         break;
     case GUT_EVENT_KEY:
+        if (ev->key == 'c' && ev->mods == (GUT_MOD_CTRL | GUT_MOD_SHIFT)) {
+            copy_selection(a, 0);
+            break;
+        }
         if (ev->mods == GUT_MOD_SHIFT && ev->key == GUT_KEY_PAGEUP) {
             gut_vt_scroll_view(&a->vt, a->buf.rows - 1);
             break;
@@ -167,10 +216,19 @@ handle_event(struct app *a, const struct gut_event *ev, int *running)
     case GUT_EVENT_TEXT:
     case GUT_EVENT_PASTE:
         gut_vt_set_view(&a->vt, 0);
+        gut_sel_clear(&a->sel);
+        gut_set_selection(a->w, NULL);
         send_event(a, ev);
         break;
+    case GUT_EVENT_MOUSE_DOWN:
+    case GUT_EVENT_MOUSE_UP:
+    case GUT_EVENT_MOUSE_MOVE:
     case GUT_EVENT_MOUSE_WHEEL:
-        gut_vt_scroll_view(&a->vt, ev->dy * 3);
+        mouse_event(a, ev);
+        break;
+    case GUT_EVENT_FOCUS_IN:
+    case GUT_EVENT_FOCUS_OUT:
+        send_event(a, ev);
         break;
     default:
         break;

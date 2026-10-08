@@ -3,9 +3,9 @@
 A single header C file to provide a graphical window for text-based apps.
 
 `guterm.h` draws a grid of character cells with a bitmap font and returns
-keyboard and mouse input as events. A program can fill the grid directly,
-or feed a stream of terminal escape sequences through the optional VT
-layer and let that fill the grid.
+keyboard, mouse and game controller input as events. A program can fill
+the grid directly, or feed a stream of terminal escape sequences through
+the optional VT layer and let that fill the grid.
 
 ## Architecture
 
@@ -30,9 +30,12 @@ The header has three layers:
 
 `gut_encode_event()` turns input events into the byte sequences an xterm
 sends, for programs that already speak the terminal protocol, including
-bracketed paste. Pastes arrive as events from the platform chords and
-middle click, IME composition is shown over the cursor and delivered as
-events, and `gut_buf_copy_text()` turns a selection into clipboard text.
+bracketed paste, mouse reports and focus reports. Pastes arrive as
+events from the platform chords and middle click, IME composition is
+shown over the cursor and delivered as events, `gut_sel` tracks a mouse
+driven selection that the window highlights, `gut_vt_mouse()` decides
+whether the program or the host gets a mouse event, and up to four game
+controllers report as events.
 
 ## Documentation
 
@@ -137,7 +140,7 @@ Windows and macOS are expected to take.
 
 Not yet done:
 
-- Selection and mouse reporting in the VT layer.
+- OSC 52, the kitty keyboard protocol and XTWINOPS in the VT layer.
 - Blink is accepted but drawn as normal text.
 - Combining characters are dropped; wide characters use two cells but
   the built-in font has no CJK glyphs, so they draw as `?`.

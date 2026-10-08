@@ -502,6 +502,298 @@ test_scrollback(void)
     gut_buf_free(&b);
 }
 
+
+static size_t
+mouse(int type, int button, int row, int col, int mods, int dx, int dy,
+      int flags, char *out, size_t n)
+{
+    struct gut_event ev;
+
+    memset(&ev, 0, sizeof(ev));
+    ev.type = type;
+    ev.button = button;
+    ev.row = row;
+    ev.col = col;
+    ev.mods = mods;
+    ev.dx = dx;
+    ev.dy = dy;
+    return gut_encode_event(&ev, out, n, flags);
+}
+
+static void
+test_mouse_encode(void)
+{
+    char out[32];
+    size_t n;
+
+    /* nothing without a tracking flag */
+    CHECK(mouse(GUT_EVENT_MOUSE_DOWN, GUT_BUTTON_LEFT, 0, 0, 0, 0, 0, 0,
+                out, sizeof(out)) == 0);
+
+    /* legacy encoding: press, release, wheel, modifiers */
+    n = mouse(GUT_EVENT_MOUSE_DOWN, GUT_BUTTON_LEFT, 4, 9, 0, 0, 0,
+              GUT_ENC_MOUSE_BTN, out, sizeof(out));
+    CHECK(n == 6 && memcmp(out, "\033[M *%", 6) == 0);
+    n = mouse(GUT_EVENT_MOUSE_UP, GUT_BUTTON_RIGHT, 4, 9, 0, 0, 0,
+              GUT_ENC_MOUSE_BTN, out, sizeof(out));
+    CHECK(n == 6 && memcmp(out, "\033[M#*%", 6) == 0);
+    n = mouse(GUT_EVENT_MOUSE_DOWN, GUT_BUTTON_MIDDLE, 0, 0, GUT_MOD_CTRL,
+              0, 0, GUT_ENC_MOUSE_BTN, out, sizeof(out));
+    CHECK(n == 6 && out[3] == 32 + 1 + 16);
+    n = mouse(GUT_EVENT_MOUSE_WHEEL, 0, 0, 0, 0, 0, 1, GUT_ENC_MOUSE_BTN,
+              out, sizeof(out));
+    CHECK(n == 6 && out[3] == 32 + 64);
+    n = mouse(GUT_EVENT_MOUSE_WHEEL, 0, 0, 0, 0, 0, -1, GUT_ENC_MOUSE_BTN,
+              out, sizeof(out));
+    CHECK(n == 6 && out[3] == 32 + 65);
+    /* beyond the legacy range */
+    CHECK(mouse(GUT_EVENT_MOUSE_DOWN, GUT_BUTTON_LEFT, 0, 230, 0, 0, 0,
+                GUT_ENC_MOUSE_BTN, out, sizeof(out)) == 0);
+
+    /* motion only under the drag and any flags */
+    CHECK(mouse(GUT_EVENT_MOUSE_MOVE, GUT_BUTTON_LEFT, 1, 1, 0, 0, 0,
+                GUT_ENC_MOUSE_BTN, out, sizeof(out)) == 0);
+    n = mouse(GUT_EVENT_MOUSE_MOVE, GUT_BUTTON_LEFT, 1, 1, 0, 0, 0,
+              GUT_ENC_MOUSE_DRAG, out, sizeof(out));
+    CHECK(n == 6 && out[3] == 32 + 32);
+    CHECK(mouse(GUT_EVENT_MOUSE_MOVE, 0, 1, 1, 0, 0, 0, GUT_ENC_MOUSE_DRAG,
+                out, sizeof(out)) == 0);
+    n = mouse(GUT_EVENT_MOUSE_MOVE, 0, 1, 1, 0, 0, 0, GUT_ENC_MOUSE_ANY,
+              out, sizeof(out));
+    CHECK(n == 6 && out[3] == 32 + 35);
+
+    /* SGR encoding, large coordinates, release with its own final */
+    n = mouse(GUT_EVENT_MOUSE_DOWN, GUT_BUTTON_LEFT, 299, 399, 0, 0, 0,
+              GUT_ENC_MOUSE_BTN | GUT_ENC_MOUSE_SGR, out, sizeof(out));
+    CHECK(n == 13 && strcmp(out, "\033[<0;400;300M") == 0);
+    n = mouse(GUT_EVENT_MOUSE_UP, GUT_BUTTON_LEFT, 0, 0, GUT_MOD_SHIFT, 0,
+              0, GUT_ENC_MOUSE_BTN | GUT_ENC_MOUSE_SGR, out, sizeof(out));
+    CHECK(n == 9 && strcmp(out, "\033[<4;1;1m") == 0);
+    n = mouse(GUT_EVENT_MOUSE_WHEEL, 0, 2, 3, 0, 0, 1,
+              GUT_ENC_MOUSE_ANY | GUT_ENC_MOUSE_SGR, out, sizeof(out));
+    CHECK(n == 10 && strcmp(out, "\033[<64;4;3M") == 0);
+    /* snprintf sizing */
+    n = mouse(GUT_EVENT_MOUSE_DOWN, GUT_BUTTON_LEFT, 0, 0, 0, 0, 0,
+              GUT_ENC_MOUSE_BTN | GUT_ENC_MOUSE_SGR, out, 4);
+    CHECK(n == 9 && strcmp(out, "\033[<") == 0);
+    n = mouse(GUT_EVENT_MOUSE_DOWN, GUT_BUTTON_LEFT, 0, 0, 0, 0, 0,
+              GUT_ENC_MOUSE_BTN, out, 3);
+    CHECK(n == 6 && out[2] == '\0');
+
+    /* focus */
+    {
+        struct gut_event ev;
+
+        memset(&ev, 0, sizeof(ev));
+        ev.type = GUT_EVENT_FOCUS_IN;
+        CHECK(gut_encode_event(&ev, out, sizeof(out), 0) == 0);
+        CHECK(gut_encode_event(&ev, out, sizeof(out), GUT_ENC_FOCUS) == 3 &&
+              strcmp(out, "\033[I") == 0);
+        ev.type = GUT_EVENT_FOCUS_OUT;
+        CHECK(gut_encode_event(&ev, out, sizeof(out), GUT_ENC_FOCUS) == 3 &&
+              strcmp(out, "\033[O") == 0);
+    }
+}
+
+static void
+test_vt_mouse(void)
+{
+    struct gut_buf b;
+    struct gut_vt vt;
+    struct gut_event ev;
+    char out[64];
+    size_t n;
+
+    gut_buf_init(&b, 10, 20);
+    gut_vt_init(&vt, &b);
+    memset(&ev, 0, sizeof(ev));
+    ev.type = GUT_EVENT_MOUSE_DOWN;
+    ev.button = GUT_BUTTON_LEFT;
+    ev.row = 2;
+    ev.col = 3;
+
+    /* no tracking: the host's event */
+    CHECK(gut_vt_mouse(&vt, &ev, out, sizeof(out)) == 0);
+
+    feed(&vt, "\033[?1000h");
+    CHECK(gut_vt_encode_flags(&vt) == GUT_ENC_MOUSE_BTN);
+    n = gut_vt_mouse(&vt, &ev, out, sizeof(out));
+    CHECK(n == 6 && memcmp(out, "\033[M $#", 6) == 0);
+    /* shift bypasses tracking */
+    ev.mods = GUT_MOD_SHIFT;
+    CHECK(gut_vt_mouse(&vt, &ev, out, sizeof(out)) == 0);
+    ev.mods = 0;
+
+    /* motion reported once per cell under 1002 */
+    feed(&vt, "\033[?1002h\033[?1006h");
+    CHECK(gut_vt_encode_flags(&vt) ==
+          (GUT_ENC_MOUSE_DRAG | GUT_ENC_MOUSE_SGR));
+    ev.type = GUT_EVENT_MOUSE_MOVE;
+    n = gut_vt_mouse(&vt, &ev, out, sizeof(out));
+    CHECK(n > 0 && strcmp(out, "\033[<32;4;3M") == 0);
+    CHECK(gut_vt_mouse(&vt, &ev, out, sizeof(out)) == 0);
+    ev.col = 4;
+    CHECK(gut_vt_mouse(&vt, &ev, out, sizeof(out)) > 0);
+    ev.button = 0;
+    ev.col = 5;
+    CHECK(gut_vt_mouse(&vt, &ev, out, sizeof(out)) == 0);
+    feed(&vt, "\033[?1003h");
+    CHECK(gut_vt_encode_flags(&vt) & GUT_ENC_MOUSE_ANY);
+    ev.col = 6;
+    n = gut_vt_mouse(&vt, &ev, out, sizeof(out));
+    CHECK(n > 0 && strcmp(out, "\033[<35;7;3M") == 0);
+    feed(&vt, "\033[?1003l\033[?1006l");
+    CHECK(gut_vt_encode_flags(&vt) == 0);
+
+    /* focus reporting */
+    ev.type = GUT_EVENT_FOCUS_IN;
+    CHECK(gut_vt_mouse(&vt, &ev, out, sizeof(out)) == 0);
+    feed(&vt, "\033[?1004h");
+    CHECK(gut_vt_mouse(&vt, &ev, out, sizeof(out)) == 3 &&
+          strcmp(out, "\033[I") == 0);
+    feed(&vt, "\033[?1004l");
+
+    /* alternate scroll: wheel becomes cursor keys on the alt screen */
+    ev.type = GUT_EVENT_MOUSE_WHEEL;
+    ev.dy = 1;
+    CHECK(gut_vt_mouse(&vt, &ev, out, sizeof(out)) == 0);
+    feed(&vt, "\033[?1049h");
+    n = gut_vt_mouse(&vt, &ev, out, sizeof(out));
+    CHECK(n == 9 && strcmp(out, "\033[A\033[A\033[A") == 0);
+    ev.dy = -1;
+    feed(&vt, "\033[?1h");
+    n = gut_vt_mouse(&vt, &ev, out, sizeof(out));
+    CHECK(n == 9 && strcmp(out, "\033OB\033OB\033OB") == 0);
+    CHECK(gut_vt_mouse(&vt, &ev, out, 4) == 9 && strcmp(out, "\033OB") == 0);
+    feed(&vt, "\033[?1000h");
+    n = gut_vt_mouse(&vt, &ev, out, sizeof(out));
+    CHECK(n == 6 && out[3] == 32 + 65);
+
+    gut_vt_free(&vt);
+    gut_buf_free(&b);
+}
+
+static int
+sel_mouse(struct gut_sel *s, const struct gut_buf *b, int type, int button,
+          int row, int col, int mods, int clicks)
+{
+    struct gut_event ev;
+
+    memset(&ev, 0, sizeof(ev));
+    ev.type = type;
+    ev.button = button;
+    ev.row = row;
+    ev.col = col;
+    ev.mods = mods;
+    ev.clicks = clicks;
+    return gut_sel_mouse(s, b, &ev);
+}
+
+static void
+test_selection(void)
+{
+    struct gut_buf b;
+    struct gut_sel s;
+    char out[64];
+
+    gut_buf_init(&b, 4, 12);
+    gut_buf_text(&b, 0, 0, "one two", gut_color_default(),
+                 gut_color_default(), 0);
+    gut_buf_text(&b, 1, 0, "three \xe6\xbc\xa2 x", gut_color_default(),
+                 gut_color_default(), 0);
+    gut_buf_text(&b, 2, 0, "four", gut_color_default(), gut_color_default(),
+                 0);
+    gut_sel_clear(&s);
+    CHECK(!s.active && gut_sel_text(&s, &b, out, sizeof(out)) == 0 &&
+          out[0] == '\0');
+
+    /* drag across rows */
+    CHECK(sel_mouse(&s, &b, GUT_EVENT_MOUSE_DOWN, GUT_BUTTON_LEFT, 0, 4, 0,
+                    1) == 0);
+    CHECK(!s.active && s.dragging);
+    CHECK(sel_mouse(&s, &b, GUT_EVENT_MOUSE_MOVE, GUT_BUTTON_LEFT, 0, 4, 0,
+                    0) == 0);
+    CHECK(sel_mouse(&s, &b, GUT_EVENT_MOUSE_MOVE, GUT_BUTTON_LEFT, 1, 2, 0,
+                    0) == 1);
+    CHECK(s.active && s.row0 == 0 && s.col0 == 4 && s.row1 == 1 &&
+          s.col1 == 2);
+    CHECK(gut_sel_contains(&s, 0, 4) && gut_sel_contains(&s, 0, 11) &&
+          gut_sel_contains(&s, 1, 0) && !gut_sel_contains(&s, 1, 3) &&
+          !gut_sel_contains(&s, 0, 3));
+    CHECK(sel_mouse(&s, &b, GUT_EVENT_MOUSE_UP, GUT_BUTTON_LEFT, 1, 2, 0,
+                    0) == 1);
+    CHECK(!s.dragging);
+    CHECK(gut_sel_text(&s, &b, out, sizeof(out)) == 7 &&
+          strcmp(out, "two\nthr") == 0);
+
+    /* backwards drag normalises */
+    sel_mouse(&s, &b, GUT_EVENT_MOUSE_DOWN, GUT_BUTTON_LEFT, 2, 3, 0, 1);
+    sel_mouse(&s, &b, GUT_EVENT_MOUSE_MOVE, GUT_BUTTON_LEFT, 2, 0, 0, 0);
+    CHECK(s.row0 == 2 && s.col0 == 0 && s.col1 == 3);
+    CHECK(gut_sel_text(&s, &b, out, sizeof(out)) == 4 &&
+          strcmp(out, "four") == 0);
+
+    /* a click clears */
+    CHECK(sel_mouse(&s, &b, GUT_EVENT_MOUSE_DOWN, GUT_BUTTON_LEFT, 3, 3, 0,
+                    1) == 1);
+    CHECK(!s.active);
+    CHECK(sel_mouse(&s, &b, GUT_EVENT_MOUSE_UP, GUT_BUTTON_LEFT, 3, 3, 0,
+                    0) == 0);
+
+    /* double click selects a word, and extends by words */
+    CHECK(sel_mouse(&s, &b, GUT_EVENT_MOUSE_DOWN, GUT_BUTTON_LEFT, 0, 5, 0,
+                    2) == 1);
+    CHECK(s.active && s.row0 == 0 && s.col0 == 4 && s.col1 == 6);
+    sel_mouse(&s, &b, GUT_EVENT_MOUSE_MOVE, GUT_BUTTON_LEFT, 0, 1, 0, 0);
+    CHECK(s.col0 == 0 && s.col1 == 6);
+    CHECK(gut_sel_text(&s, &b, out, sizeof(out)) == 7 &&
+          strcmp(out, "one two") == 0);
+    sel_mouse(&s, &b, GUT_EVENT_MOUSE_UP, GUT_BUTTON_LEFT, 0, 1, 0, 0);
+
+    /* triple click selects the line */
+    sel_mouse(&s, &b, GUT_EVENT_MOUSE_DOWN, GUT_BUTTON_LEFT, 1, 3, 0, 3);
+    CHECK(s.row0 == 1 && s.col0 == 0 && s.col1 == 11);
+    sel_mouse(&s, &b, GUT_EVENT_MOUSE_UP, GUT_BUTTON_LEFT, 1, 3, 0, 0);
+    CHECK(strcmp(out, "one two") == 0);
+    CHECK(gut_sel_text(&s, &b, out, sizeof(out)) == 11 &&
+          strcmp(out, "three \xe6\xbc\xa2 x") == 0);
+
+    /* a wide character is taken whole */
+    sel_mouse(&s, &b, GUT_EVENT_MOUSE_DOWN, GUT_BUTTON_LEFT, 1, 7, 0, 1);
+    sel_mouse(&s, &b, GUT_EVENT_MOUSE_MOVE, GUT_BUTTON_LEFT, 1, 9, 0, 0);
+    CHECK(s.col0 == 6 && s.col1 == 9);
+    sel_mouse(&s, &b, GUT_EVENT_MOUSE_UP, GUT_BUTTON_LEFT, 1, 9, 0, 0);
+
+    /* shift click moves the nearer end */
+    CHECK(sel_mouse(&s, &b, GUT_EVENT_MOUSE_DOWN, GUT_BUTTON_LEFT, 2, 2,
+                    GUT_MOD_SHIFT, 1) == 1);
+    CHECK(s.row0 == 1 && s.col0 == 6 && s.row1 == 2 && s.col1 == 2);
+    sel_mouse(&s, &b, GUT_EVENT_MOUSE_UP, GUT_BUTTON_LEFT, 2, 2, 0, 0);
+
+    /* alt drag is a rectangle */
+    sel_mouse(&s, &b, GUT_EVENT_MOUSE_DOWN, GUT_BUTTON_LEFT, 0, 4,
+              GUT_MOD_ALT, 1);
+    sel_mouse(&s, &b, GUT_EVENT_MOUSE_MOVE, GUT_BUTTON_LEFT, 2, 1, 0, 0);
+    CHECK(s.mode == GUT_COPY_RECT && s.row0 == 0 && s.col0 == 1 &&
+          s.row1 == 2 && s.col1 == 4);
+    CHECK(gut_sel_contains(&s, 1, 2) && !gut_sel_contains(&s, 1, 5));
+    CHECK(gut_sel_text(&s, &b, out, sizeof(out)) == 13 &&
+          strcmp(out, "ne t\nhree\nour") == 0);
+
+    /* the right button is not a selection */
+    CHECK(sel_mouse(&s, &b, GUT_EVENT_MOUSE_DOWN, GUT_BUTTON_RIGHT, 0, 0, 0,
+                    1) == 0);
+    CHECK(s.active);
+
+    /* out of range points clamp */
+    gut_sel_begin(&s, &b, -5, 99, GUT_COPY_STREAM, GUT_SEL_CELL);
+    CHECK(s.row0 == 0 && s.col0 == 11);
+    gut_sel_extend(&s, &b, 99, -1);
+    CHECK(s.row1 == 3 && s.col1 == 0);
+
+    gut_buf_free(&b);
+}
+
 int
 main(void)
 {
@@ -512,6 +804,9 @@ main(void)
     test_copy();
     test_vt();
     test_scrollback();
+    test_mouse_encode();
+    test_vt_mouse();
+    test_selection();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

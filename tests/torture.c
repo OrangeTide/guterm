@@ -443,7 +443,12 @@ torture_encode(unsigned long iterations)
         size_t n;
 
         memset(&ev, 0, sizeof(ev));
-        ev.type = rnd_range(GUT_EVENT_NONE, GUT_EVENT_FOCUS_OUT);
+        ev.type = rnd_range(GUT_EVENT_NONE, GUT_EVENT_PAD_AXIS);
+        ev.button = rnd_range(0, 4);
+        ev.row = rnd_range(-1, 300);
+        ev.col = rnd_range(-1, 300);
+        ev.dx = rnd_range(-2, 2);
+        ev.dy = rnd_range(-2, 2);
         ev.mods = rnd_range(0, 15);
         switch (rnd_range(0, 2)) {
         case 0: ev.key = rnd_range(GUT_KEY_NONE, GUT_KEY_F12 + 3); break;
@@ -468,11 +473,11 @@ torture_encode(unsigned long iterations)
             ev.type = rnd_range(0, 1) ? GUT_EVENT_PASTE : GUT_EVENT_COMPOSE;
         }
 
-        n = gut_encode_event(&ev, out, cap, rnd_range(0, 15));
+        n = gut_encode_event(&ev, out, cap, rnd_range(0, 511));
         if (cap > 0 && out[n < cap ? n : cap - 1] != '\0')
             FAIL("encode output not terminated, %lu for cap %lu",
                  (unsigned long)n, (unsigned long)cap);
-        if (ev.type == GUT_EVENT_PASTE && n > ev.len + 12)
+        if (ev.type == GUT_EVENT_PASTE && ev.data && n > ev.len + 12)
             FAIL("paste encoding longer than text plus brackets");
         free(data);
         free(out);
@@ -506,6 +511,68 @@ torture_copy(unsigned long iterations)
             FAIL("copy length %lu does not match %lu", (unsigned long)n,
                  (unsigned long)strlen(out));
         free(out);
+    }
+    gut_buf_free(&b);
+}
+
+
+/* Random mouse events over a random buffer; the selection must stay
+ * normalised and inside the buffer, and its text must terminate. */
+static void
+torture_sel(unsigned long iterations)
+{
+    struct gut_buf b;
+    struct gut_sel s;
+    char text[64];
+
+    gut_buf_init(&b, rnd_range(1, 20), rnd_range(1, 60));
+    gut_sel_clear(&s);
+    for (iter = 0; iter < iterations; iter++) {
+        struct gut_event ev;
+        char out[32];
+        size_t cap = (size_t)rnd_range(0, sizeof(out));
+
+        if (rnd_range(0, 3) == 0) {
+            for (int i = 0; i < (int)sizeof(text) - 1; i++)
+                text[i] = (char)rnd_range(0x20, 0x7E);
+            text[rnd_range(0, 63)] = '\0';
+            gut_buf_text(&b, rnd_range(0, b.rows - 1), rnd_range(0, b.cols),
+                         text, rnd_color(), rnd_color(), 0);
+            gut_buf_put(&b, rnd_range(0, b.rows - 1), rnd_range(0, b.cols),
+                        0x4E00 + rnd_range(0, 100), gut_color_default(),
+                        gut_color_default(), 0);
+        }
+        memset(&ev, 0, sizeof(ev));
+        ev.type = rnd_range(GUT_EVENT_MOUSE_DOWN, GUT_EVENT_MOUSE_WHEEL);
+        ev.button = rnd_range(0, 3);
+        ev.row = rnd_range(-2, b.rows + 1);
+        ev.col = rnd_range(-2, b.cols + 1);
+        ev.mods = rnd_range(0, 15);
+        ev.clicks = rnd_range(0, 4);
+        gut_sel_mouse(&s, &b, &ev);
+        if (rnd_range(0, 9) == 0)
+            gut_sel_extend(&s, &b, rnd_range(-5, 50), rnd_range(-5, 100));
+        if (s.active) {
+            if (s.row0 < 0 || s.row1 >= b.rows || s.col0 < 0 ||
+                s.col1 >= b.cols)
+                FAIL("selection %d,%d..%d,%d outside %dx%d", s.row0, s.col0,
+                     s.row1, s.col1, b.rows, b.cols);
+            if (s.row0 > s.row1 ||
+                (s.mode == GUT_COPY_RECT ? s.col0 > s.col1
+                 : s.row0 == s.row1 && s.col0 > s.col1))
+                FAIL("selection %d,%d..%d,%d not normalised", s.row0, s.col0,
+                     s.row1, s.col1);
+            if (!gut_sel_contains(&s, s.row0, s.col0) ||
+                !gut_sel_contains(&s, s.row1, s.col1))
+                FAIL("selection does not contain its ends");
+        }
+        gut_sel_text(&s, &b, out, cap);
+        if (cap > 0 && memchr(out, '\0', cap) == NULL)
+            FAIL("selection text not terminated");
+        if (rnd_range(0, 99) == 0) {
+            gut_buf_resize(&b, rnd_range(1, 20), rnd_range(1, 60));
+            gut_sel_clear(&s);
+        }
     }
     gut_buf_free(&b);
 }
@@ -559,6 +626,7 @@ main(int argc, char **argv)
     torture_buf(iterations);
     torture_encode(iterations);
     torture_copy(iterations);
+    torture_sel(iterations);
     torture_utf8(iterations);
     printf("torture: %d failures\n", failures);
     return failures ? 1 : 0;
